@@ -1,10 +1,23 @@
 from __future__ import annotations
 
-import cv2
-import gradio as gr
-import numpy as np
+import logging
 
-from detector import PSA_MIN_RATIO, UNCERTAIN_MSG, analyze_centering
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+logger = logging.getLogger(__name__)
+logger.info("Starting Trading Card Centering Detector app import.")
+
+try:
+    import cv2
+    import gradio as gr
+    import numpy as np
+
+    from detector import PSA_MIN_RATIO, UNCERTAIN_MSG, analyze_centering
+except Exception:
+    logger.exception("App startup import failed; re-raising to hard-fail startup.")
+    raise
+
+logger.info("App imports loaded successfully.")
 
 
 def _format_result(status: str, confidence: float, lr_ratio: float | None, tb_ratio: float | None) -> str:
@@ -62,6 +75,7 @@ If confidence is low, the app returns: **UNCERTAIN – insufficient photo qualit
     )
 
 demo.queue()
+logger.info("Gradio demo initialized and queue enabled.")
 
 
 if __name__ == "__main__":
