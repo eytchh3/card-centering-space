@@ -58,7 +58,7 @@ If confidence is low, the app returns: **UNCERTAIN – insufficient photo qualit
         fn=run_detector,
         inputs=inp,
         outputs=[out_text, out_img],
-        api_name="analyze",
+        api_name="/analyze",
     )
 
 demo.queue()
