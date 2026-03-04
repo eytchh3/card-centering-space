@@ -54,7 +54,14 @@ If confidence is low, the app returns: **UNCERTAIN – insufficient photo qualit
     out_text = gr.Textbox(label="Centering Result", lines=8)
 
     btn = gr.Button("Analyze")
-    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img])
+    btn.click(
+        fn=run_detector,
+        inputs=inp,
+        outputs=[out_text, out_img],
+        api_name="analyze",
+    )
+
+demo.queue()
 
 
 if __name__ == "__main__":
