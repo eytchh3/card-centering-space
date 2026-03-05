@@ -135,6 +135,86 @@ def _expand_quad(quad: np.ndarray, scale: float, shape: Tuple[int, int]) -> np.n
     return expanded.astype(np.float32)
 
 
+def _sample_gradient(grad_mag: np.ndarray, point: np.ndarray) -> float:
+    h, w = grad_mag.shape
+    x = int(np.clip(round(float(point[0])), 0, w - 1))
+    y = int(np.clip(round(float(point[1])), 0, h - 1))
+    return float(grad_mag[y, x])
+
+
+def _expand_quad_to_card_boundary(gray: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    h, w = gray.shape
+    quad = _order_quad_points(quad)
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(gx, gy)
+
+    max_steps = max(12, int(0.12 * min(h, w)))
+    side_points: list[np.ndarray] = []
+
+    for idx in range(4):
+        p0 = quad[idx]
+        p1 = quad[(idx + 1) % 4]
+        edge = p1 - p0
+        length = float(np.linalg.norm(edge))
+        if length < 1e-6:
+            side_points.append(np.array([p0], dtype=np.float32))
+            continue
+
+        tangent = edge / length
+        normal = np.array([tangent[1], -tangent[0]], dtype=np.float32)
+
+        num_samples = max(16, int(length / 20))
+        ts = np.linspace(0.05, 0.95, num_samples)
+        moved_points: list[np.ndarray] = []
+
+        for t in ts:
+            base = p0 + (edge * float(t))
+            profile = np.zeros(max_steps + 1, dtype=np.float32)
+
+            for step in range(max_steps + 1):
+                profile[step] = _sample_gradient(grad_mag, base + normal * step)
+
+            profile = cv2.GaussianBlur(profile.reshape(1, -1), (1, 5), 0).reshape(-1)
+            peak_idx = int(np.argmax(profile))
+            peak_val = float(profile[peak_idx])
+            drop_threshold = max(5.0, peak_val * 0.35)
+
+            stop_idx = peak_idx
+            for step in range(peak_idx + 1, max_steps + 1):
+                if profile[step] < drop_threshold:
+                    stop_idx = step
+                    break
+
+            moved_points.append(base + normal * float(stop_idx))
+
+        if moved_points:
+            side_points.append(np.array(moved_points, dtype=np.float32))
+        else:
+            side_points.append(np.array([p0, p1], dtype=np.float32))
+
+    lines = [_line_from_points(points) for points in side_points]
+    if any(line is None for line in lines):
+        return quad
+
+    tl = _line_intersection(lines[0], lines[3])
+    tr = _line_intersection(lines[1], lines[0])
+    br = _line_intersection(lines[2], lines[1])
+    bl = _line_intersection(lines[3], lines[2])
+    if any(corner is None for corner in [tl, tr, br, bl]):
+        return quad
+
+    expanded = _order_quad_points(np.array([tl, tr, br, bl], dtype=np.float32))
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, w - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, h - 1)
+
+    if cv2.contourArea(expanded) < cv2.contourArea(quad) * 0.9:
+        return quad
+    return expanded
+
+
 def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     dst = np.array(
         [[0, 0], [WARP_WIDTH - 1, 0], [WARP_WIDTH - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
@@ -144,16 +224,23 @@ def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, matrix, (WARP_WIDTH, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
 
 
-def _draw_outer_quad_labels(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+def _draw_outer_quad_labels(image: np.ndarray, initial_quad: np.ndarray, expanded_quad: np.ndarray) -> np.ndarray:
     debug = image.copy()
-    points = quad.astype(int)
     labels = ["TL", "TR", "BR", "BL"]
     colors = [(0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
 
-    cv2.polylines(debug, [points], True, (0, 255, 0), 2)
-    for (x, y), label, color in zip(points, labels, colors):
+    initial_points = initial_quad.astype(int)
+    expanded_points = expanded_quad.astype(int)
+
+    cv2.polylines(debug, [initial_points], True, (0, 255, 255), 2)
+    cv2.polylines(debug, [expanded_points], True, (0, 255, 0), 2)
+
+    for (x, y), label, color in zip(expanded_points, labels, colors):
         cv2.circle(debug, (x, y), 8, color, -1)
         cv2.putText(debug, label, (x + 10, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    cv2.putText(debug, "initial", tuple(initial_points[0] + np.array([10, 20])), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(debug, "expanded", tuple(expanded_points[0] + np.array([10, -10])), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     return debug
 
@@ -174,9 +261,6 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
     if not contours:
         return None
 
-
-def _detect_frame_by_edge_scanning(warped: np.ndarray) -> Optional[Tuple[np.ndarray, Dict[str, int]]]:
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     card_area = float(h * w)
     candidates: list[tuple[float, np.ndarray]] = []
@@ -233,9 +317,6 @@ def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
     frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
     return frame_quad
 
-    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
-    return frame_quad
-
 def _ratio_text(a: float, b: float) -> str:
     total = max(a + b, 1e-6)
     left = int(round((a / total) * 100))
@@ -286,8 +367,9 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         card_quad = _expand_quad(inner_quad, scale=1.18, shape=gray.shape)
         card_source = "inner_frame_fallback"
 
-    card_quad = _order_quad_points(card_quad)
-    warped = _warp_card(image_bgr, card_quad)
+    initial_quad = _order_quad_points(card_quad)
+    expanded_quad = _expand_quad_to_card_boundary(gray, initial_quad)
+    warped = _warp_card(image_bgr, expanded_quad)
     warped_preview = _draw_warp_preview_border(warped)
 
     frame_quad = _detect_frame_by_contour(warped)
@@ -312,11 +394,12 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "centering_lr": _ratio_text(left_border, right_border),
         "centering_tb": _ratio_text(top_border, bottom_border),
         "card_detection": card_source,
-        "outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in card_quad],
+        "outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in expanded_quad],
+        "initial_outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in initial_quad],
         "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
         "warped_image": warped_preview,
         "warped_card": warped_preview,
-        "debug_image": _draw_outer_quad_labels(image_bgr, card_quad),
+        "debug_image": _draw_outer_quad_labels(image_bgr, initial_quad, expanded_quad),
         "warped_debug_image": _draw_debug(
             warped=warped_preview,
             card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
