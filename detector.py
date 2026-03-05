@@ -149,6 +149,9 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
     if not contours:
         return None
 
+
+def _detect_frame_by_edge_scanning(warped: np.ndarray) -> Optional[Tuple[np.ndarray, Dict[str, int]]]:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     card_area = float(h * w)
     candidates: list[tuple[float, np.ndarray]] = []
