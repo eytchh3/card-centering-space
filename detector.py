@@ -534,6 +534,7 @@ def _draw_debug(
     frame_debug: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     debug = warped.copy()
+    overlay = debug.copy()
     h, w = debug.shape[:2]
 
     for x, y in card_quad.astype(int):
@@ -556,12 +557,33 @@ def _draw_debug(
     left_x, right_x = int(frame[0][0]), int(frame[1][0])
     top_y, bottom_y = int(frame[0][1]), int(frame[3][1])
 
-    mid_y = h // 2
-    mid_x = w // 2
-    cv2.line(debug, (0, mid_y), (left_x, mid_y), (255, 0, 0), 2)
-    cv2.line(debug, (right_x, mid_y), (w - 1, mid_y), (255, 0, 0), 2)
-    cv2.line(debug, (mid_x, 0), (mid_x, top_y), (0, 0, 255), 2)
-    cv2.line(debug, (mid_x, bottom_y), (mid_x, h - 1), (0, 0, 255), 2)
+    left_x = int(np.clip(left_x, 0, w - 1))
+    right_x = int(np.clip(right_x, 0, w - 1))
+    top_y = int(np.clip(top_y, 0, h - 1))
+    bottom_y = int(np.clip(bottom_y, 0, h - 1))
+
+    comb_ratios = np.arange(0.10, 0.91, 0.05)
+    for ratio in comb_ratios:
+        y = int(round((h - 1) * ratio))
+        cv2.line(overlay, (0, y), (left_x, y), (255, 80, 80), 1)
+        cv2.line(overlay, (w - 1, y), (right_x, y), (255, 80, 80), 1)
+
+    for ratio in comb_ratios:
+        x = int(round((w - 1) * ratio))
+        cv2.line(overlay, (x, 0), (x, top_y), (80, 80, 255), 1)
+        cv2.line(overlay, (x, h - 1), (x, bottom_y), (80, 80, 255), 1)
+
+    cv2.addWeighted(overlay, 0.35, debug, 0.65, 0, debug)
+
+    left_border_px = left_x
+    right_border_px = (w - 1) - right_x
+    top_border_px = top_y
+    bottom_border_px = (h - 1) - bottom_y
+
+    cv2.putText(debug, f"L: {left_border_px}px", (10, max(24, h // 2 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 180), 2)
+    cv2.putText(debug, f"R: {right_border_px}px", (max(10, w - 170), max(24, h // 2 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 180), 2)
+    cv2.putText(debug, f"T: {top_border_px}px", (max(10, w // 2 - 70), 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 255), 2)
+    cv2.putText(debug, f"B: {bottom_border_px}px", (max(10, w // 2 - 70), h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 255), 2)
 
     method = (frame_debug or {}).get("method", "frame_lines")
     label = "frame: border-color fallback" if used_fallback_frame else f"frame: {method}"
