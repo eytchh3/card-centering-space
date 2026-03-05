@@ -11,13 +11,18 @@ WARP_HEIGHT = 1000
 
 def _order_quad_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.astype(np.float32)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).reshape(-1)
+    y_sorted = pts[np.argsort(pts[:, 1])]
+    top = y_sorted[:2]
+    bottom = y_sorted[2:]
+
+    top = top[np.argsort(top[:, 0])]
+    bottom = bottom[np.argsort(bottom[:, 0])]
+
     ordered = np.zeros((4, 2), dtype=np.float32)
-    ordered[0] = pts[np.argmin(s)]  # tl
-    ordered[1] = pts[np.argmin(d)]  # tr
-    ordered[2] = pts[np.argmax(s)]  # br
-    ordered[3] = pts[np.argmax(d)]  # bl
+    ordered[0] = top[0]  # tl
+    ordered[1] = top[1]  # tr
+    ordered[2] = bottom[1]  # br
+    ordered[3] = bottom[0]  # bl
     return ordered
 
 
@@ -137,6 +142,27 @@ def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     )
     matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
     return cv2.warpPerspective(image, matrix, (WARP_WIDTH, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
+
+
+def _draw_outer_quad_labels(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    debug = image.copy()
+    points = quad.astype(int)
+    labels = ["TL", "TR", "BR", "BL"]
+    colors = [(0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
+
+    cv2.polylines(debug, [points], True, (0, 255, 0), 2)
+    for (x, y), label, color in zip(points, labels, colors):
+        cv2.circle(debug, (x, y), 8, color, -1)
+        cv2.putText(debug, label, (x + 10, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    return debug
+
+
+def _draw_warp_preview_border(warped: np.ndarray) -> np.ndarray:
+    preview = warped.copy()
+    h, w = preview.shape[:2]
+    cv2.rectangle(preview, (0, 0), (w - 1, h - 1), (0, 255, 0), 3)
+    return preview
 
 
 def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
@@ -260,7 +286,9 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         card_quad = _expand_quad(inner_quad, scale=1.18, shape=gray.shape)
         card_source = "inner_frame_fallback"
 
+    card_quad = _order_quad_points(card_quad)
     warped = _warp_card(image_bgr, card_quad)
+    warped_preview = _draw_warp_preview_border(warped)
 
     frame_quad = _detect_frame_by_contour(warped)
     used_fallback_frame = False
@@ -284,11 +312,13 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "centering_lr": _ratio_text(left_border, right_border),
         "centering_tb": _ratio_text(top_border, bottom_border),
         "card_detection": card_source,
+        "outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in card_quad],
         "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
-        "warped_image": warped,
-        "warped_card": warped,
-        "debug_image": _draw_debug(
-            warped=warped,
+        "warped_image": warped_preview,
+        "warped_card": warped_preview,
+        "debug_image": _draw_outer_quad_labels(image_bgr, card_quad),
+        "warped_debug_image": _draw_debug(
+            warped=warped_preview,
             card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
             frame_quad=frame,
             used_fallback_frame=used_fallback_frame,
