@@ -5,8 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-WARP_WIDTH = 700
-WARP_HEIGHT = 1000
+CARD_ASPECT_RATIO = 1.4
 
 
 def _order_quad_points(pts: np.ndarray) -> np.ndarray:
@@ -247,12 +246,18 @@ def _expand_quad_to_card_boundary(gray: np.ndarray, quad: np.ndarray) -> Tuple[n
 
 
 def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    ordered_quad = _order_quad_points(quad)
+    width = int(round(float(np.linalg.norm(ordered_quad[1] - ordered_quad[0]))))
+    width = max(width, 1)
+    height = int(round(width * CARD_ASPECT_RATIO))
+    height = max(height, 1)
+
     dst = np.array(
-        [[0, 0], [WARP_WIDTH - 1, 0], [WARP_WIDTH - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
         dtype=np.float32,
     )
-    matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-    return cv2.warpPerspective(image, matrix, (WARP_WIDTH, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
+    matrix = cv2.getPerspectiveTransform(ordered_quad.astype(np.float32), dst)
+    return cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_LINEAR)
 
 
 def _draw_outer_quad_labels(
