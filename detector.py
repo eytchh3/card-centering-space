@@ -208,6 +208,8 @@ def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
     frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
     return frame_quad
 
+    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
+    return frame_quad
 
 def _ratio_text(a: float, b: float) -> str:
     total = max(a + b, 1e-6)
