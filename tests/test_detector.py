@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 import cv2
 import numpy as np
 
-from detector import _select_edge_horizontal_line, analyze_centering
+from detector import _detect_frame_by_contour, _select_edge_horizontal_line, analyze_centering
 
 
 def make_card_image(offset_x=0, offset_y=0, perspective=False):
@@ -108,3 +108,17 @@ def test_select_edge_horizontal_line_rejects_too_deep_lines():
 
     assert top is None
     assert bottom is None
+
+
+def test_detect_frame_rejects_diagonal_and_keeps_top_border():
+    warped = np.full((1000, 700, 3), 210, dtype=np.uint8)
+    cv2.rectangle(warped, (70, 90), (630, 910), (60, 60, 60), 5)
+    cv2.line(warped, (120, 260), (600, 640), (30, 30, 30), 10)
+
+    frame_quad, debug = _detect_frame_by_contour(warped)
+
+    assert frame_quad is not None
+    ordered = frame_quad.astype(np.float32)
+    top_y = float(np.mean(ordered[:2, 1]))
+    assert top_y < 220
+    assert debug["method"] in {"frame_lines", "contour"}

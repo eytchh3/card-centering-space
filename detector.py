@@ -312,6 +312,70 @@ def _line_angle(line: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0)
 
 
+def _hough_endpoints(rho: float, theta: float, width: int, height: int) -> np.ndarray:
+    cos_t = float(np.cos(theta))
+    sin_t = float(np.sin(theta))
+    intersections: list[tuple[float, float]] = []
+
+    if abs(sin_t) > 1e-6:
+        y_at_x0 = rho / sin_t
+        y_at_xw = (rho - (width - 1) * cos_t) / sin_t
+        if 0 <= y_at_x0 <= height - 1:
+            intersections.append((0.0, float(y_at_x0)))
+        if 0 <= y_at_xw <= height - 1:
+            intersections.append((float(width - 1), float(y_at_xw)))
+
+    if abs(cos_t) > 1e-6:
+        x_at_y0 = rho / cos_t
+        x_at_yh = (rho - (height - 1) * sin_t) / cos_t
+        if 0 <= x_at_y0 <= width - 1:
+            intersections.append((float(x_at_y0), 0.0))
+        if 0 <= x_at_yh <= width - 1:
+            intersections.append((float(x_at_yh), float(height - 1)))
+
+    if len(intersections) < 2:
+        return np.array([0.0, 0.0, float(width - 1), float(height - 1)], dtype=np.float32)
+
+    unique_points: list[tuple[float, float]] = []
+    for pt in intersections:
+        if not any(np.hypot(pt[0] - x, pt[1] - y) < 1.0 for x, y in unique_points):
+            unique_points.append(pt)
+
+    if len(unique_points) < 2:
+        unique_points = intersections[:2]
+
+    max_dist = -1.0
+    best_pair = (unique_points[0], unique_points[1])
+    for i in range(len(unique_points)):
+        for j in range(i + 1, len(unique_points)):
+            d = float(np.hypot(unique_points[i][0] - unique_points[j][0], unique_points[i][1] - unique_points[j][1]))
+            if d > max_dist:
+                max_dist = d
+                best_pair = (unique_points[i], unique_points[j])
+
+    return np.array([best_pair[0][0], best_pair[0][1], best_pair[1][0], best_pair[1][1]], dtype=np.float32)
+
+
+def _line_from_hough(rho: float, theta: float) -> Tuple[np.ndarray, np.ndarray]:
+    direction = np.array([float(-np.sin(theta)), float(np.cos(theta))], dtype=np.float32)
+    point = np.array([float(np.cos(theta) * rho), float(np.sin(theta) * rho)], dtype=np.float32)
+    return point, direction
+
+
+def _line_support_score(edge_dist: np.ndarray, rho: float, theta: float, width: int, height: int, band_px: float = 2.5) -> float:
+    segment = _hough_endpoints(rho, theta, width, height)
+    x1, y1, x2, y2 = map(float, segment)
+    length = float(np.hypot(x2 - x1, y2 - y1))
+    samples = max(30, int(length / 4.0))
+    hit = 0
+    for t in np.linspace(0.0, 1.0, samples):
+        x = int(np.clip(round(x1 + (x2 - x1) * float(t)), 0, width - 1))
+        y = int(np.clip(round(y1 + (y2 - y1) * float(t)), 0, height - 1))
+        if float(edge_dist[y, x]) <= band_px:
+            hit += 1
+    return float(hit / max(samples, 1))
+
+
 def _select_edge_horizontal_line(
     horizontal_lines: list[np.ndarray],
     card_height: int,
@@ -348,83 +412,184 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], 
     edges = cv2.Canny(blur, 35, 120)
 
     h, w = gray.shape
-    min_line_length = max(20, int(0.18 * w))
-    hough_threshold = max(25, int(0.07 * min(h, w)))
-    raw_lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=hough_threshold,
-        minLineLength=min_line_length,
-        maxLineGap=max(18, int(0.04 * w)),
-    )
+    border_pct = 0.12
+    side_band_x = max(4, int(round(w * border_pct)))
+    side_band_y = max(4, int(round(h * border_pct)))
+    border_mask = np.zeros_like(edges, dtype=np.uint8)
+    border_mask[:side_band_y, :] = 255
+    border_mask[h - side_band_y :, :] = 255
+    border_mask[:, :side_band_x] = 255
+    border_mask[:, w - side_band_x :] = 255
+    border_mask = cv2.dilate(border_mask, np.ones((5, 5), np.uint8), iterations=1)
 
-    all_lines = [] if raw_lines is None else [line[0].astype(np.float32) for line in raw_lines]
-    if len(all_lines) < 8:
-        reduced_threshold = max(15, int(hough_threshold * 0.7))
-        raw_lines = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=reduced_threshold,
-            minLineLength=min_line_length,
-            maxLineGap=max(18, int(0.04 * w)),
-        )
-        all_lines = [] if raw_lines is None else [line[0].astype(np.float32) for line in raw_lines]
+    border_edges = cv2.bitwise_and(edges, border_mask)
+    edge_dist = cv2.distanceTransform(255 - border_edges, cv2.DIST_L2, 3)
 
-    angle_tolerance = 10.0
-    vertical_lines: list[np.ndarray] = []
-    horizontal_lines: list[np.ndarray] = []
-    line_angles: list[float] = []
-    for line in all_lines:
-        angle = _line_angle(line)
-        line_angles.append(angle)
-        if min(abs(angle - 90.0), abs(angle - 270.0)) <= angle_tolerance:
-            vertical_lines.append(line)
-        elif min(abs(angle - 0.0), abs(angle - 180.0)) <= angle_tolerance:
-            horizontal_lines.append(line)
+    hough_threshold = max(30, int(0.08 * min(h, w)))
+    raw_lines = cv2.HoughLines(border_edges, rho=1, theta=np.pi / 180, threshold=hough_threshold)
 
-    lengths = [_line_length(line) for line in all_lines]
-    avg_length = float(np.mean(lengths)) if lengths else 0.0
+    candidates: list[Dict[str, Any]] = []
+    if raw_lines is not None:
+        for raw in raw_lines[:, 0, :]:
+            rho, theta = map(float, raw)
+            theta_deg = float(np.degrees(theta) % 180.0)
+            is_horizontal = min(abs(theta_deg - 0.0), abs(theta_deg - 180.0)) < 8.0
+            is_vertical = abs(theta_deg - 90.0) < 8.0
+            if not is_horizontal and not is_vertical:
+                continue
 
+            endpoint_line = _hough_endpoints(rho, theta, w, h)
+            support = _line_support_score(edge_dist, rho, theta, w, h)
+            border_pref = 0.0
+            side = None
+
+            if is_horizontal:
+                sin_t = float(np.sin(theta))
+                if abs(sin_t) < 1e-6:
+                    continue
+                y_mid = float((rho - (0.5 * (w - 1)) * np.cos(theta)) / sin_t)
+                if 0 <= y_mid <= 0.2 * (h - 1):
+                    side = "top"
+                    border_pref = 1.0 - min(1.0, y_mid / max(1.0, 0.2 * h))
+                elif 0.8 * (h - 1) <= y_mid <= (h - 1):
+                    side = "bottom"
+                    border_pref = 1.0 - min(1.0, ((h - 1) - y_mid) / max(1.0, 0.2 * h))
+                else:
+                    continue
+            else:
+                cos_t = float(np.cos(theta))
+                if abs(cos_t) < 1e-6:
+                    continue
+                x_mid = float((rho - (0.5 * (h - 1)) * np.sin(theta)) / cos_t)
+                if 0 <= x_mid <= 0.2 * (w - 1):
+                    side = "left"
+                    border_pref = 1.0 - min(1.0, x_mid / max(1.0, 0.2 * w))
+                elif 0.8 * (w - 1) <= x_mid <= (w - 1):
+                    side = "right"
+                    border_pref = 1.0 - min(1.0, ((w - 1) - x_mid) / max(1.0, 0.2 * w))
+                else:
+                    continue
+
+            candidates.append(
+                {
+                    "rho": rho,
+                    "theta": theta,
+                    "theta_deg": theta_deg,
+                    "line": endpoint_line,
+                    "support": support,
+                    "border_pref": border_pref,
+                    "side": side,
+                }
+            )
+
+    side_candidates = {"top": [], "bottom": [], "left": [], "right": []}
+    for cand in candidates:
+        side_candidates[cand["side"]].append(cand)
+
+    for key in side_candidates:
+        side_candidates[key].sort(key=lambda c: (c["support"] + 0.5 * c["border_pref"]), reverse=True)
+
+    vertical_lines = [c["line"] for c in side_candidates["left"] + side_candidates["right"]]
+    horizontal_lines = [c["line"] for c in side_candidates["top"] + side_candidates["bottom"]]
+    line_angles = [c["theta_deg"] for c in candidates]
+    avg_length = float(np.mean([_line_length(c["line"]) for c in candidates])) if candidates else 0.0
+
+    best_selection: dict[str, Dict[str, Any]] = {}
     rejected_rectangles: list[np.ndarray] = []
     frame_quad: Optional[np.ndarray] = None
     confidence_score = 0.0
 
-    if len(vertical_lines) >= 2 and len(horizontal_lines) >= 2:
-        x_mids = np.array([(line[0] + line[2]) * 0.5 for line in vertical_lines], dtype=np.float32)
-        left_x = float(np.quantile(x_mids, 0.2))
-        right_x = float(np.quantile(x_mids, 0.8))
-        top_y = _select_edge_horizontal_line(horizontal_lines, h, edge="top", min_inset_px=8)
-        bottom_y = _select_edge_horizontal_line(horizontal_lines, h, edge="bottom", min_inset_px=8)
+    top_pool = side_candidates["top"][:5]
+    bottom_pool = side_candidates["bottom"][:5]
+    left_pool = side_candidates["left"][:5]
+    right_pool = side_candidates["right"][:5]
 
-        if top_y is None or bottom_y is None or top_y >= bottom_y:
-            top_y = None
-            bottom_y = None
+    if top_pool and bottom_pool and left_pool and right_pool:
+        best_score = -1.0
+        for top in top_pool:
+            for bottom in bottom_pool:
+                for left in left_pool:
+                    for right in right_pool:
+                        lines = {
+                            "top": _line_from_hough(top["rho"], top["theta"]),
+                            "bottom": _line_from_hough(bottom["rho"], bottom["theta"]),
+                            "left": _line_from_hough(left["rho"], left["theta"]),
+                            "right": _line_from_hough(right["rho"], right["theta"]),
+                        }
+                        tl = _line_intersection(lines["left"], lines["top"])
+                        tr = _line_intersection(lines["right"], lines["top"])
+                        br = _line_intersection(lines["right"], lines["bottom"])
+                        bl = _line_intersection(lines["left"], lines["bottom"])
+                        if any(corner is None for corner in [tl, tr, br, bl]):
+                            continue
 
-        if top_y is not None and bottom_y is not None:
-            candidate = _order_quad_points(
-                np.array([[left_x, top_y], [right_x, top_y], [right_x, bottom_y], [left_x, bottom_y]], dtype=np.float32)
-            )
-            candidate_area = float(cv2.contourArea(candidate))
-            min_area = 0.06 * float(h * w)
-            in_bounds = np.all(
-                (candidate[:, 0] >= -0.12 * w)
-                & (candidate[:, 0] <= 1.12 * w)
-                & (candidate[:, 1] >= -0.12 * h)
-                & (candidate[:, 1] <= 1.12 * h)
-            )
-            candidate_width = max(1e-6, right_x - left_x)
-            candidate_height = max(1e-6, bottom_y - top_y)
-            aspect = candidate_height / candidate_width
-            aspect_score = 1.0 - min(0.4, abs(aspect - CARD_ASPECT_RATIO) / CARD_ASPECT_RATIO)
-            coverage_score = min(1.0, candidate_area / max(min_area, 1.0))
-            confidence_score = float(max(0.0, min(1.0, 0.55 * coverage_score + 0.45 * aspect_score)))
+                        quad = _order_quad_points(np.array([tl, tr, br, bl], dtype=np.float32))
+                        area = float(cv2.contourArea(quad))
+                        if area < 0.06 * h * w:
+                            rejected_rectangles.append(quad)
+                            continue
 
-            if candidate_area >= min_area and in_bounds and confidence_score >= 0.45:
-                frame_quad = candidate
-            else:
-                rejected_rectangles.append(candidate)
+                        width_px = float(np.linalg.norm(quad[1] - quad[0]))
+                        height_px = float(np.linalg.norm(quad[3] - quad[0]))
+                        if width_px < 1 or height_px < 1:
+                            continue
+                        aspect = height_px / width_px
+                        parallel_score = 1.0 - min(1.0, abs(top["theta_deg"] - bottom["theta_deg"]) / 15.0)
+                        orth_score = 1.0 - min(1.0, abs(abs(top["theta_deg"] - left["theta_deg"]) - 90.0) / 15.0)
+                        support_score = float(np.mean([top["support"], bottom["support"], left["support"], right["support"]]))
+                        border_score = float(np.mean([top["border_pref"], bottom["border_pref"], left["border_pref"], right["border_pref"]]))
+                        aspect_score = 1.0 - min(1.0, abs(aspect - CARD_ASPECT_RATIO) / 0.5)
+                        total = 0.22 * parallel_score + 0.22 * orth_score + 0.24 * support_score + 0.14 * border_score + 0.18 * aspect_score
+
+                        if total > best_score:
+                            best_score = total
+                            frame_quad = quad
+                            confidence_score = total
+                            best_selection = {"top": top, "bottom": bottom, "left": left, "right": right}
+
+    inferred_lines: dict[str, Dict[str, Any]] = {}
+    if frame_quad is None and bottom_pool and left_pool and right_pool:
+        bottom = bottom_pool[0]
+        left = left_pool[0]
+        right = right_pool[0]
+        bottom_line = _line_from_hough(bottom["rho"], bottom["theta"])
+        left_line = _line_from_hough(left["rho"], left["theta"])
+        right_line = _line_from_hough(right["rho"], right["theta"])
+
+        left_x = min(float(left["line"][0]), float(left["line"][2]))
+        right_x = max(float(right["line"][0]), float(right["line"][2]))
+        inferred_width = max(1.0, right_x - left_x)
+        inferred_height = CARD_ASPECT_RATIO * inferred_width
+        bottom_mid_y = float((bottom["line"][1] + bottom["line"][3]) * 0.5)
+        y_top = float(np.clip(bottom_mid_y - inferred_height, 0.0, h * 0.22))
+        x_mid = 0.5 * (left_x + right_x)
+        inferred_rho = float(x_mid * np.cos(bottom["theta"]) + y_top * np.sin(bottom["theta"]))
+
+        top_inferred = {
+            "rho": inferred_rho,
+            "theta": bottom["theta"],
+            "theta_deg": bottom["theta_deg"],
+            "line": _hough_endpoints(inferred_rho, bottom["theta"], w, h),
+            "support": 0.0,
+            "border_pref": 0.0,
+            "side": "top",
+            "source": "inferred",
+        }
+
+        top_line = _line_from_hough(top_inferred["rho"], top_inferred["theta"])
+        tl = _line_intersection(left_line, top_line)
+        tr = _line_intersection(right_line, top_line)
+        br = _line_intersection(right_line, bottom_line)
+        bl = _line_intersection(left_line, bottom_line)
+
+        if not any(corner is None for corner in [tl, tr, br, bl]):
+            quad = _order_quad_points(np.array([tl, tr, br, bl], dtype=np.float32))
+            area = float(cv2.contourArea(quad))
+            if area >= 0.05 * h * w:
+                frame_quad = quad
+                confidence_score = max(confidence_score, 0.42)
+                best_selection = {"bottom": bottom, "left": left, "right": right}
+                inferred_lines["top"] = top_inferred
 
     print("Frame detection debug:")
     print("vertical lines:", len(vertical_lines))
@@ -432,6 +597,12 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], 
     print("avg line length:", round(avg_length, 2))
     print("line angles:", [round(angle, 1) for angle in line_angles[:20]])
     print("confidence:", round(confidence_score, 3))
+    if best_selection:
+        selected = {k: round(float(v["theta_deg"]), 2) for k, v in best_selection.items()}
+        print("selected line angles (deg):", selected)
+    if inferred_lines:
+        inferred = {k: round(float(v["theta_deg"]), 2) for k, v in inferred_lines.items()}
+        print("inferred line angles (deg):", inferred)
 
     if frame_quad is not None:
         return frame_quad, {
@@ -440,6 +611,8 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], 
             "horizontal_lines": horizontal_lines,
             "rejected_rectangles": rejected_rectangles,
             "confidence": confidence_score,
+            "selected_lines": {k: v["line"] for k, v in best_selection.items()},
+            "inferred_lines": {k: v["line"] for k, v in inferred_lines.items()},
         }
 
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -550,6 +723,16 @@ def _draw_debug(
     for line in (frame_debug or {}).get("horizontal_lines", []):
         x1, y1, x2, y2 = map(int, np.round(line))
         cv2.line(debug, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+    for side, line in (frame_debug or {}).get("selected_lines", {}).items():
+        x1, y1, x2, y2 = map(int, np.round(line))
+        cv2.line(debug, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(debug, f"sel:{side}", (x1 + 8, y1 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    for side, line in (frame_debug or {}).get("inferred_lines", {}).items():
+        x1, y1, x2, y2 = map(int, np.round(line))
+        cv2.line(debug, (x1, y1), (x2, y2), (0, 165, 255), 2)
+        cv2.putText(debug, f"inf:{side}", (x1 + 8, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
     for rejected in (frame_debug or {}).get("rejected_rectangles", []):
         cv2.polylines(debug, [rejected.astype(int)], True, (0, 0, 255), 1)
