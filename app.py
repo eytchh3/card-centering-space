@@ -12,19 +12,38 @@ import numpy as np
 from detector import analyze_centering
 
 
+def _format_result(result: dict) -> str:
+    if "error" in result:
+        return result["error"]
+
+    return "\n".join(
+        [
+            "Centering analysis complete",
+            f"Left border: {result['left_border_px']}px",
+            f"Right border: {result['right_border_px']}px",
+            f"Top border: {result['top_border_px']}px",
+            f"Bottom border: {result['bottom_border_px']}px",
+            f"Centering L/R: {result['centering_lr']}",
+            f"Centering T/B: {result['centering_tb']}",
+            f"Card detection: {result['card_detection']}",
+            f"Frame detection: {result['frame_detection']}",
+        ]
+    )
+
+
 def run_detector(image: np.ndarray):
     if image is None:
         return "Error", "Card not detected", None
 
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     result = analyze_centering(bgr)
-
-    if "error" in result:
-        return "Error", "Card not detected", None
+    text = _format_result(result)
 
     debug = result.get("debug_image")
-    debug_rgb = cv2.cvtColor(debug, cv2.COLOR_BGR2RGB) if debug is not None else None
-    return result.get("centering_lr", "Error"), result.get("centering_tb", "Card not detected"), debug_rgb
+    if debug is None:
+        return text, None
+
+    return text, cv2.cvtColor(debug, cv2.COLOR_BGR2RGB)
 
 
 with gr.Blocks(title="Trading Card Centering Detector") as demo:
@@ -38,21 +57,17 @@ Classical CV centering pipeline for listing photos and scans:
 4. Measures edge-to-frame borders and reports centering ratios.
 5. Returns a debug overlay showing corners, frame, and measurements.
 
-If card detection fails, outputs are: `Error`, `Card not detected`, and no debug image.
+If card detection fails, the API returns: `{"error": "Card could not be detected"}`.
 """
     )
 
     with gr.Row():
         inp = gr.Image(type="numpy", label="Card Photo")
-
-    with gr.Row():
-        out_lr = gr.Textbox(label="Left/Right Centering")
-        out_tb = gr.Textbox(label="Top/Bottom Centering")
-
-    out_img = gr.Image(type="numpy", label="Debug Overlay")
+        out_img = gr.Image(type="numpy", label="Debug Overlay")
+    out_text = gr.Textbox(label="Centering Result", lines=10)
 
     btn = gr.Button("Analyze")
-    btn.click(fn=run_detector, inputs=inp, outputs=[out_lr, out_tb, out_img], api_name="/analyze")
+    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img], api_name="/analyze")
 
 demo.queue()
 
