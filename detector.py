@@ -302,16 +302,123 @@ def _draw_warp_preview_border(warped: np.ndarray) -> np.ndarray:
     return preview
 
 
-def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
+def _line_length(line: np.ndarray) -> float:
+    x1, y1, x2, y2 = map(float, line)
+    return float(np.hypot(x2 - x1, y2 - y1))
+
+
+def _line_angle(line: np.ndarray) -> float:
+    x1, y1, x2, y2 = map(float, line)
+    return float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0)
+
+
+def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 40, 130)
+    edges = cv2.Canny(blur, 35, 120)
+
+    h, w = gray.shape
+    min_line_length = max(20, int(0.18 * w))
+    hough_threshold = max(25, int(0.07 * min(h, w)))
+    raw_lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=hough_threshold,
+        minLineLength=min_line_length,
+        maxLineGap=max(18, int(0.04 * w)),
+    )
+
+    all_lines = [] if raw_lines is None else [line[0].astype(np.float32) for line in raw_lines]
+    if len(all_lines) < 8:
+        reduced_threshold = max(15, int(hough_threshold * 0.7))
+        raw_lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=reduced_threshold,
+            minLineLength=min_line_length,
+            maxLineGap=max(18, int(0.04 * w)),
+        )
+        all_lines = [] if raw_lines is None else [line[0].astype(np.float32) for line in raw_lines]
+
+    angle_tolerance = 10.0
+    vertical_lines: list[np.ndarray] = []
+    horizontal_lines: list[np.ndarray] = []
+    line_angles: list[float] = []
+    for line in all_lines:
+        angle = _line_angle(line)
+        line_angles.append(angle)
+        if min(abs(angle - 90.0), abs(angle - 270.0)) <= angle_tolerance:
+            vertical_lines.append(line)
+        elif min(abs(angle - 0.0), abs(angle - 180.0)) <= angle_tolerance:
+            horizontal_lines.append(line)
+
+    lengths = [_line_length(line) for line in all_lines]
+    avg_length = float(np.mean(lengths)) if lengths else 0.0
+
+    rejected_rectangles: list[np.ndarray] = []
+    frame_quad: Optional[np.ndarray] = None
+    confidence_score = 0.0
+
+    if len(vertical_lines) >= 2 and len(horizontal_lines) >= 2:
+        x_mids = np.array([(line[0] + line[2]) * 0.5 for line in vertical_lines], dtype=np.float32)
+        y_mids = np.array([(line[1] + line[3]) * 0.5 for line in horizontal_lines], dtype=np.float32)
+
+        left_x = float(np.quantile(x_mids, 0.2))
+        right_x = float(np.quantile(x_mids, 0.8))
+        top_y = float(np.quantile(y_mids, 0.2))
+        bottom_y = float(np.quantile(y_mids, 0.8))
+
+        candidate = _order_quad_points(
+            np.array([[left_x, top_y], [right_x, top_y], [right_x, bottom_y], [left_x, bottom_y]], dtype=np.float32)
+        )
+        candidate_area = float(cv2.contourArea(candidate))
+        min_area = 0.06 * float(h * w)
+        in_bounds = np.all(
+            (candidate[:, 0] >= -0.12 * w)
+            & (candidate[:, 0] <= 1.12 * w)
+            & (candidate[:, 1] >= -0.12 * h)
+            & (candidate[:, 1] <= 1.12 * h)
+        )
+        candidate_width = max(1e-6, right_x - left_x)
+        candidate_height = max(1e-6, bottom_y - top_y)
+        aspect = candidate_height / candidate_width
+        aspect_score = 1.0 - min(0.4, abs(aspect - CARD_ASPECT_RATIO) / CARD_ASPECT_RATIO)
+        coverage_score = min(1.0, candidate_area / max(min_area, 1.0))
+        confidence_score = float(max(0.0, min(1.0, 0.55 * coverage_score + 0.45 * aspect_score)))
+
+        if candidate_area >= min_area and in_bounds and confidence_score >= 0.45:
+            frame_quad = candidate
+        else:
+            rejected_rectangles.append(candidate)
+
+    print("Frame detection debug:")
+    print("vertical lines:", len(vertical_lines))
+    print("horizontal lines:", len(horizontal_lines))
+    print("avg line length:", round(avg_length, 2))
+    print("line angles:", [round(angle, 1) for angle in line_angles[:20]])
+    print("confidence:", round(confidence_score, 3))
+
+    if frame_quad is not None:
+        return frame_quad, {
+            "method": "frame_lines",
+            "vertical_lines": vertical_lines,
+            "horizontal_lines": horizontal_lines,
+            "rejected_rectangles": rejected_rectangles,
+            "confidence": confidence_score,
+        }
 
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return None, {
+            "method": "none",
+            "vertical_lines": vertical_lines,
+            "horizontal_lines": horizontal_lines,
+            "rejected_rectangles": rejected_rectangles,
+            "confidence": confidence_score,
+        }
 
-    h, w = gray.shape
     card_area = float(h * w)
     candidates: list[tuple[float, np.ndarray]] = []
 
@@ -339,9 +446,21 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
         candidates.append((score, quad))
 
     if not candidates:
-        return None
+        return None, {
+            "method": "none",
+            "vertical_lines": vertical_lines,
+            "horizontal_lines": horizontal_lines,
+            "rejected_rectangles": rejected_rectangles,
+            "confidence": confidence_score,
+        }
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    return candidates[0][1], {
+        "method": "contour",
+        "vertical_lines": vertical_lines,
+        "horizontal_lines": horizontal_lines,
+        "rejected_rectangles": rejected_rectangles,
+        "confidence": confidence_score,
+    }
 
 
 def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
@@ -379,6 +498,7 @@ def _draw_debug(
     card_quad: np.ndarray,
     frame_quad: np.ndarray,
     used_fallback_frame: bool,
+    frame_debug: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     debug = warped.copy()
     h, w = debug.shape[:2]
@@ -388,6 +508,17 @@ def _draw_debug(
 
     frame = frame_quad.astype(int)
     cv2.polylines(debug, [frame], True, (0, 255, 0), 2)
+
+    for line in (frame_debug or {}).get("vertical_lines", []):
+        x1, y1, x2, y2 = map(int, np.round(line))
+        cv2.line(debug, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+    for line in (frame_debug or {}).get("horizontal_lines", []):
+        x1, y1, x2, y2 = map(int, np.round(line))
+        cv2.line(debug, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+    for rejected in (frame_debug or {}).get("rejected_rectangles", []):
+        cv2.polylines(debug, [rejected.astype(int)], True, (0, 0, 255), 1)
 
     left_x, right_x = int(frame[0][0]), int(frame[1][0])
     top_y, bottom_y = int(frame[0][1]), int(frame[3][1])
@@ -399,7 +530,8 @@ def _draw_debug(
     cv2.line(debug, (mid_x, 0), (mid_x, top_y), (0, 0, 255), 2)
     cv2.line(debug, (mid_x, bottom_y), (mid_x, h - 1), (0, 0, 255), 2)
 
-    label = "frame: border-color fallback" if used_fallback_frame else "frame: contour"
+    method = (frame_debug or {}).get("method", "frame_lines")
+    label = "frame: border-color fallback" if used_fallback_frame else f"frame: {method}"
     cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     return debug
 
@@ -421,12 +553,14 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
     expanded_quad, expansion_debug = _expand_quad_to_card_boundary(gray, initial_quad)
     warped = _warp_card(image_bgr, expanded_quad)
     warped_preview = _draw_warp_preview_border(warped)
+    warped_output = cv2.resize(warped_preview, (700, 1000), interpolation=cv2.INTER_LINEAR)
 
-    frame_quad = _detect_frame_by_contour(warped)
+    frame_quad, frame_debug = _detect_frame_by_contour(warped)
     used_fallback_frame = False
     if frame_quad is None:
         frame_quad = _estimate_frame_by_border_color(warped)
         used_fallback_frame = True
+        frame_debug = {"method": "border_color_fallback", **(frame_debug or {})}
 
     h, w = warped.shape[:2]
     frame = _order_quad_points(frame_quad)
@@ -446,15 +580,16 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "card_detection": card_source,
         "outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in expanded_quad],
         "initial_outer_quad": [[round(float(x), 2), round(float(y), 2)] for x, y in initial_quad],
-        "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
-        "warped_image": warped_preview,
-        "warped_card": warped_preview,
+        "frame_detection": "border_color_fallback" if used_fallback_frame else frame_debug.get("method", "frame_lines"),
+        "warped_image": warped_output,
+        "warped_card": warped_output,
         "debug_image": _draw_outer_quad_labels(image_bgr, initial_quad, expanded_quad, expansion_debug),
         "warped_debug_image": _draw_debug(
             warped=warped_preview,
             card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
             frame_quad=frame,
             used_fallback_frame=used_fallback_frame,
+            frame_debug=frame_debug,
         ),
     }
     return result
