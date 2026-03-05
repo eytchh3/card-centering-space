@@ -1,25 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
-
-PSA_MIN_RATIO = 45.0 / 55.0
-UNCERTAIN_MSG = "UNCERTAIN – insufficient photo quality."
-
-
-@dataclass
-class DetectionResult:
-    status: str
-    confidence: float
-    lr_ratio: Optional[float]
-    tb_ratio: Optional[float]
-    details: Dict[str, Any]
-    warped: Optional[np.ndarray] = None
-    overlay: Optional[np.ndarray] = None
+CARD_ASPECT_RATIO = 2.5 / 3.5  # width / height
+WARP_HEIGHT = 1000
 
 
 def _order_quad_points(pts: np.ndarray) -> np.ndarray:
@@ -28,187 +15,281 @@ def _order_quad_points(pts: np.ndarray) -> np.ndarray:
     d = np.diff(pts, axis=1).reshape(-1)
     ordered = np.zeros((4, 2), dtype=np.float32)
     ordered[0] = pts[np.argmin(s)]  # tl
-    ordered[2] = pts[np.argmax(s)]  # br
     ordered[1] = pts[np.argmin(d)]  # tr
+    ordered[2] = pts[np.argmax(s)]  # br
     ordered[3] = pts[np.argmax(d)]  # bl
     return ordered
 
 
-def _find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def _line_from_points(points: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if points.shape[0] < 8:
+        return None
+    vx, vy, x0, y0 = cv2.fitLine(points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01)
+    direction = np.array([float(vx.item()), float(vy.item())], dtype=np.float32)
+    origin = np.array([float(x0.item()), float(y0.item())], dtype=np.float32)
+    if np.linalg.norm(direction) < 1e-6:
+        return None
+    return origin, direction
+
+
+def _line_intersection(
+    line_a: Tuple[np.ndarray, np.ndarray], line_b: Tuple[np.ndarray, np.ndarray]
+) -> Optional[np.ndarray]:
+    p, r = line_a
+    q, s = line_b
+    matrix = np.array([[r[0], -s[0]], [r[1], -s[1]]], dtype=np.float32)
+    det = float(np.linalg.det(matrix))
+    if abs(det) < 1e-6:
+        return None
+    rhs = q - p
+    t_u = np.linalg.solve(matrix, rhs)
+    intersection = p + (t_u[0] * r)
+    return intersection.astype(np.float32)
+
+
+def _quad_from_hough(gray: np.ndarray, min_area_ratio: float) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    h, w = gray.shape
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 60, 160)
+    edges = cv2.Canny(blur, 50, 150)
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, 0.0
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=int(min(h, w) * 0.2),
+        maxLineGap=20,
+    )
 
-    h, w = gray.shape
-    img_area = float(h * w)
-    best = None
-    best_score = -1.0
+    if lines is None or len(lines) < 8:
+        return None, {"reason": "insufficient_hough_lines"}
 
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < 0.1 * img_area:
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) < 4:
-            continue
+    vertical_segments = []
+    horizontal_segments = []
+    for raw in lines[:, 0, :]:
+        x1, y1, x2, y2 = map(float, raw)
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0
+        segment = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+        if angle < 25 or angle > 155:
+            horizontal_segments.append(segment)
+        elif 65 < angle < 115:
+            vertical_segments.append(segment)
 
-        rect = cv2.minAreaRect(c)
-        box = cv2.boxPoints(rect)
-        box_area = cv2.contourArea(box)
-        if box_area <= 0:
-            continue
+    if len(vertical_segments) < 2 or len(horizontal_segments) < 2:
+        return None, {"reason": "missing_line_orientations"}
 
-        rectangularity = float(area / box_area)
-        fill_ratio = area / img_area
-        score = (0.55 * rectangularity) + (0.45 * min(1.0, fill_ratio / 0.85))
+    v_pts = np.vstack(vertical_segments)
+    h_pts = np.vstack(horizontal_segments)
 
-        if score > best_score:
-            best_score = score
-            best = box
+    x_q1, x_q3 = np.quantile(v_pts[:, 0], [0.25, 0.75])
+    y_q1, y_q3 = np.quantile(h_pts[:, 1], [0.25, 0.75])
 
-    if best is None:
-        return None, 0.0
-    return _order_quad_points(best), float(np.clip(best_score, 0.0, 1.0))
+    left_line = _line_from_points(v_pts[v_pts[:, 0] <= x_q1])
+    right_line = _line_from_points(v_pts[v_pts[:, 0] >= x_q3])
+    top_line = _line_from_points(h_pts[h_pts[:, 1] <= y_q1])
+    bottom_line = _line_from_points(h_pts[h_pts[:, 1] >= y_q3])
+
+    if any(line is None for line in [left_line, right_line, top_line, bottom_line]):
+        return None, {"reason": "line_fitting_failed"}
+
+    tl = _line_intersection(left_line, top_line)
+    tr = _line_intersection(right_line, top_line)
+    br = _line_intersection(right_line, bottom_line)
+    bl = _line_intersection(left_line, bottom_line)
+
+    if any(corner is None for corner in [tl, tr, br, bl]):
+        return None, {"reason": "line_intersection_failed"}
+
+    quad = _order_quad_points(np.array([tl, tr, br, bl], dtype=np.float32))
+
+    area = cv2.contourArea(quad)
+    min_area = min_area_ratio * float(h * w)
+    if area < min_area:
+        return None, {"reason": "quad_too_small", "area": float(area)}
+
+    in_bounds = np.all((quad[:, 0] >= -0.1 * w) & (quad[:, 0] <= 1.1 * w) & (quad[:, 1] >= -0.1 * h) & (quad[:, 1] <= 1.1 * h))
+    if not in_bounds:
+        return None, {"reason": "quad_out_of_bounds"}
+
+    return quad, {
+        "reason": "ok",
+        "hough_lines": int(len(lines)),
+        "vertical_segments": int(len(vertical_segments)),
+        "horizontal_segments": int(len(horizontal_segments)),
+        "area": float(area),
+    }
 
 
-def _warp_card(image: np.ndarray, quad: np.ndarray, h_out: int = 1000) -> np.ndarray:
-    aspect = 2.5 / 3.5  # standard card width/height
-    w_out = int(h_out * aspect)
-    dst = np.array([[0, 0], [w_out - 1, 0], [w_out - 1, h_out - 1], [0, h_out - 1]], dtype=np.float32)
-    m = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-    warped = cv2.warpPerspective(image, m, (w_out, h_out), flags=cv2.INTER_LINEAR)
-    return warped
+def _expand_quad(quad: np.ndarray, scale: float, shape: Tuple[int, int]) -> np.ndarray:
+    h, w = shape
+    center = np.mean(quad, axis=0)
+    expanded = center + (quad - center) * scale
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, w - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, h - 1)
+    return expanded.astype(np.float32)
 
 
-def _smooth_1d(arr: np.ndarray, k: int = 21) -> np.ndarray:
-    k = max(3, int(k) | 1)
-    kernel = np.ones(k, dtype=np.float32) / k
-    return np.convolve(arr.astype(np.float32), kernel, mode="same")
+def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    w_out = int(WARP_HEIGHT * CARD_ASPECT_RATIO)
+    dst = np.array(
+        [[0, 0], [w_out - 1, 0], [w_out - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    return cv2.warpPerspective(image, matrix, (w_out, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
 
 
-def _peak_in_range(profile: np.ndarray, lo: int, hi: int) -> Tuple[int, float, float]:
-    lo = int(np.clip(lo, 0, len(profile) - 1))
-    hi = int(np.clip(hi, lo + 1, len(profile)))
-    seg = profile[lo:hi]
-    idx_local = int(np.argmax(seg))
-    idx = lo + idx_local
-    peak = float(seg[idx_local])
-    baseline = float(np.median(seg)) if len(seg) else 0.0
-    prominence = max(0.0, peak - baseline)
-    return idx, peak, prominence
-
-
-def _detect_inner_rails(warped: np.ndarray) -> Tuple[Optional[Dict[str, Any]], float]:
+def _detect_frame_by_edge_scanning(warped: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    core_y0, core_y1 = int(0.18 * h), int(0.82 * h)
-    core = gray[core_y0:core_y1, :]
-    gx = cv2.Sobel(core, cv2.CV_32F, 1, 0, ksize=3)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    vertical_band = blur[int(0.15 * h) : int(0.85 * h), :]
+    gx = cv2.Sobel(vertical_band, cv2.CV_32F, 1, 0, ksize=3)
     x_profile = np.mean(np.abs(gx), axis=0)
-    x_profile = _smooth_1d(x_profile, k=max(15, w // 40))
+    x_profile = cv2.GaussianBlur(x_profile.reshape(1, -1), (max(9, (w // 30) | 1), 1), 0).reshape(-1)
 
-    lx, lpk, lprom = _peak_in_range(x_profile, int(0.05 * w), int(0.45 * w))
-    rx, rpk, rprom = _peak_in_range(x_profile, int(0.55 * w), int(0.95 * w))
-    if rx <= lx + int(0.15 * w):
-        return None, 0.0
-
-    core_x0, core_x1 = int(lx + 0.08 * (rx - lx)), int(rx - 0.08 * (rx - lx))
-    core_x0 = max(0, min(core_x0, w - 2))
-    core_x1 = max(core_x0 + 1, min(core_x1, w - 1))
-
-    mid = gray[:, core_x0:core_x1]
-    gy = cv2.Sobel(mid, cv2.CV_32F, 0, 1, ksize=3)
+    horizontal_band = blur[:, int(0.15 * w) : int(0.85 * w)]
+    gy = cv2.Sobel(horizontal_band, cv2.CV_32F, 0, 1, ksize=3)
     y_profile = np.mean(np.abs(gy), axis=1)
-    y_profile = _smooth_1d(y_profile, k=max(15, h // 40))
+    y_profile = cv2.GaussianBlur(y_profile.reshape(-1, 1), (1, max(9, (h // 30) | 1)), 0).reshape(-1)
 
-    ty, tpk, tprom = _peak_in_range(y_profile, int(0.05 * h), int(0.45 * h))
-    by, bpk, bprom = _peak_in_range(y_profile, int(0.55 * h), int(0.95 * h))
-    if by <= ty + int(0.15 * h):
-        return None, 0.0
+    def _scan_first_strong(profile: np.ndarray, start: int, end: int, step: int) -> Optional[int]:
+        lo = min(start, end)
+        hi = max(start, end)
+        if hi - lo < 5:
+            return None
+        segment = profile[lo:hi]
+        threshold = float(np.percentile(segment, 75) + 0.30 * (np.max(segment) - np.percentile(segment, 75)))
+        idx = start
+        while (idx < end) if step > 0 else (idx > end):
+            if profile[idx] >= threshold:
+                return int(idx)
+            idx += step
+        return None
 
-    prom = np.array([lprom, rprom, tprom, bprom], dtype=np.float32)
-    scale = float(np.percentile(np.concatenate([x_profile, y_profile]), 90) + 1e-6)
-    norm = np.clip(prom / scale, 0.0, 3.0)
-    conf = float(np.clip(np.mean(norm) / 1.5, 0.0, 1.0))
+    left = _scan_first_strong(x_profile, int(0.03 * w), int(0.45 * w), 1)
+    right = _scan_first_strong(x_profile, int(0.97 * w), int(0.55 * w), -1)
+    top = _scan_first_strong(y_profile, int(0.03 * h), int(0.45 * h), 1)
+    bottom = _scan_first_strong(y_profile, int(0.97 * h), int(0.55 * h), -1)
 
-    return {
-        "left": lx,
-        "right": rx,
-        "top": ty,
-        "bottom": by,
-        "x_profile": x_profile,
-        "y_profile": y_profile,
-        "peaks": {"l": lpk, "r": rpk, "t": tpk, "b": bpk},
-    }, conf
+    if any(v is None for v in [left, right, top, bottom]):
+        return None
+
+    if right <= left + int(0.2 * w) or bottom <= top + int(0.2 * h):
+        return None
+
+    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
+    return frame_quad
 
 
-def analyze_centering(image_bgr: np.ndarray, conf_threshold: float = 0.45) -> DetectionResult:
-    quad, card_conf = _find_card_quad(image_bgr)
-    if quad is None:
-        return DetectionResult(
-            status=UNCERTAIN_MSG,
-            confidence=0.0,
-            lr_ratio=None,
-            tb_ratio=None,
-            details={"reason": "outer_card_not_found"},
-        )
+def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
 
-    warped = _warp_card(image_bgr, quad)
-    rails, rail_conf = _detect_inner_rails(warped)
-    if rails is None:
-        return DetectionResult(
-            status=UNCERTAIN_MSG,
-            confidence=card_conf * 0.5,
-            lr_ratio=None,
-            tb_ratio=None,
-            details={"reason": "inner_frame_not_found", "card_conf": card_conf},
-            warped=warped,
-        )
+    mid_band = gray[int(0.2 * h) : int(0.8 * h), :]
+    vert_grad = np.mean(np.abs(np.diff(mid_band.astype(np.float32), axis=1)), axis=0)
+
+    side_band = gray[:, int(0.2 * w) : int(0.8 * w)]
+    horiz_grad = np.mean(np.abs(np.diff(side_band.astype(np.float32), axis=0)), axis=1)
+
+    smooth_kx = max(9, (w // 40) | 1)
+    smooth_ky = max(9, (h // 40) | 1)
+    vert_grad = cv2.GaussianBlur(vert_grad.reshape(1, -1), (smooth_kx, 1), 0).reshape(-1)
+    horiz_grad = cv2.GaussianBlur(horiz_grad.reshape(-1, 1), (1, smooth_ky), 0).reshape(-1)
+
+    left = int(np.argmax(vert_grad[: int(0.45 * w)]))
+    right = int(np.argmax(vert_grad[int(0.55 * w) :]) + int(0.55 * w))
+    top = int(np.argmax(horiz_grad[: int(0.45 * h)]))
+    bottom = int(np.argmax(horiz_grad[int(0.55 * h) :]) + int(0.55 * h))
+
+    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
+    return frame_quad
+
+
+def _ratio_text(a: float, b: float) -> str:
+    total = max(a + b, 1e-6)
+    left = int(round((a / total) * 100))
+    right = 100 - left
+    return f"{left}/{right}"
+
+
+def _draw_debug(
+    warped: np.ndarray,
+    card_quad: np.ndarray,
+    frame_quad: np.ndarray,
+    used_fallback_frame: bool,
+) -> np.ndarray:
+    debug = warped.copy()
+    h, w = debug.shape[:2]
+
+    for x, y in card_quad.astype(int):
+        cv2.circle(debug, (x, y), 8, (0, 255, 255), -1)
+
+    frame = frame_quad.astype(int)
+    cv2.polylines(debug, [frame], True, (0, 255, 0), 2)
+
+    left_x, right_x = int(frame[0][0]), int(frame[1][0])
+    top_y, bottom_y = int(frame[0][1]), int(frame[3][1])
+
+    mid_y = h // 2
+    mid_x = w // 2
+    cv2.line(debug, (0, mid_y), (left_x, mid_y), (255, 0, 0), 2)
+    cv2.line(debug, (right_x, mid_y), (w - 1, mid_y), (255, 0, 0), 2)
+    cv2.line(debug, (mid_x, 0), (mid_x, top_y), (0, 0, 255), 2)
+    cv2.line(debug, (mid_x, bottom_y), (mid_x, h - 1), (0, 0, 255), 2)
+
+    label = "frame: border-color fallback" if used_fallback_frame else "frame: edge-scan"
+    cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    return debug
+
+
+def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    card_quad, card_meta = _quad_from_hough(gray, min_area_ratio=0.2)
+    card_source = "outer_edge"
+
+    if card_quad is None:
+        inner_quad, inner_meta = _quad_from_hough(gray, min_area_ratio=0.08)
+        if inner_quad is None:
+            return {"error": "Card could not be detected", "details": {"outer": card_meta, "inner": inner_meta}}
+        card_quad = _expand_quad(inner_quad, scale=1.18, shape=gray.shape)
+        card_source = "inner_frame_fallback"
+
+    warped = _warp_card(image_bgr, card_quad)
+
+    frame_quad = _detect_frame_by_edge_scanning(warped)
+    used_fallback_frame = False
+    if frame_quad is None:
+        frame_quad = _estimate_frame_by_border_color(warped)
+        used_fallback_frame = True
 
     h, w = warped.shape[:2]
-    left_gap = float(rails["left"])
-    right_gap = float((w - 1) - rails["right"])
-    top_gap = float(rails["top"])
-    bottom_gap = float((h - 1) - rails["bottom"])
+    frame = _order_quad_points(frame_quad)
 
-    lr_ratio = min(left_gap, right_gap) / max(left_gap, right_gap, 1e-6)
-    tb_ratio = min(top_gap, bottom_gap) / max(top_gap, bottom_gap, 1e-6)
+    left_border = float(frame[0][0])
+    right_border = float((w - 1) - frame[1][0])
+    top_border = float(frame[0][1])
+    bottom_border = float((h - 1) - frame[2][1])
 
-    confidence = float(np.clip(0.55 * card_conf + 0.45 * rail_conf, 0.0, 1.0))
-
-    overlay = warped.copy()
-    cv2.line(overlay, (int(rails["left"]), 0), (int(rails["left"]), h - 1), (0, 255, 0), 2)
-    cv2.line(overlay, (int(rails["right"]), 0), (int(rails["right"]), h - 1), (0, 255, 0), 2)
-    cv2.line(overlay, (0, int(rails["top"])), (w - 1, int(rails["top"])), (255, 0, 0), 2)
-    cv2.line(overlay, (0, int(rails["bottom"])), (w - 1, int(rails["bottom"])), (255, 0, 0), 2)
-
-    if confidence < conf_threshold:
-        status = UNCERTAIN_MSG
-    else:
-        passed = (lr_ratio >= PSA_MIN_RATIO) and (tb_ratio >= PSA_MIN_RATIO)
-        status = "PASS" if passed else "FAIL"
-
-    return DetectionResult(
-        status=status,
-        confidence=confidence,
-        lr_ratio=lr_ratio,
-        tb_ratio=tb_ratio,
-        details={
-            "left_gap": left_gap,
-            "right_gap": right_gap,
-            "top_gap": top_gap,
-            "bottom_gap": bottom_gap,
-            "card_conf": card_conf,
-            "rail_conf": rail_conf,
-            "threshold_ratio": PSA_MIN_RATIO,
-        },
-        warped=warped,
-        overlay=overlay,
-    )
+    result = {
+        "left_border_px": round(left_border, 2),
+        "right_border_px": round(right_border, 2),
+        "top_border_px": round(top_border, 2),
+        "bottom_border_px": round(bottom_border, 2),
+        "centering_lr": _ratio_text(left_border, right_border),
+        "centering_tb": _ratio_text(top_border, bottom_border),
+        "card_detection": card_source,
+        "frame_detection": "border_color_fallback" if used_fallback_frame else "edge_scan",
+        "warped_image": warped,
+        "debug_image": _draw_debug(
+            warped=warped,
+            card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+            frame_quad=frame,
+            used_fallback_frame=used_fallback_frame,
+        ),
+    }
+    return result
