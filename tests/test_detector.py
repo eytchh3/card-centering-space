@@ -6,7 +6,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 import cv2
 import numpy as np
 
-from detector import analyze_centering
+from detector import _select_edge_horizontal_line, analyze_centering
 
 
 def make_card_image(offset_x=0, offset_y=0, perspective=False):
@@ -80,3 +80,31 @@ def test_blank_image_returns_error():
     img = np.zeros((600, 600, 3), dtype=np.uint8)
     result = analyze_centering(img)
     assert result["error"] == "Card could not be detected"
+
+
+def test_select_edge_horizontal_line_prefers_edge_nearby_candidates():
+    lines = [
+        np.array([10, 35, 690, 35], dtype=np.float32),
+        np.array([12, 120, 688, 120], dtype=np.float32),
+        np.array([8, 955, 692, 955], dtype=np.float32),
+        np.array([15, 860, 685, 860], dtype=np.float32),
+    ]
+
+    top = _select_edge_horizontal_line(lines, card_height=1000, edge="top", min_inset_px=8)
+    bottom = _select_edge_horizontal_line(lines, card_height=1000, edge="bottom", min_inset_px=8)
+
+    assert top == 35
+    assert bottom == 955
+
+
+def test_select_edge_horizontal_line_rejects_too_deep_lines():
+    lines = [
+        np.array([10, 420, 690, 420], dtype=np.float32),
+        np.array([10, 580, 690, 580], dtype=np.float32),
+    ]
+
+    top = _select_edge_horizontal_line(lines, card_height=1000, edge="top", min_inset_px=8)
+    bottom = _select_edge_horizontal_line(lines, card_height=1000, edge="bottom", min_inset_px=8)
+
+    assert top is None
+    assert bottom is None

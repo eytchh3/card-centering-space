@@ -312,6 +312,36 @@ def _line_angle(line: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0)
 
 
+def _select_edge_horizontal_line(
+    horizontal_lines: list[np.ndarray],
+    card_height: int,
+    edge: str,
+    min_inset_px: int = 8,
+) -> Optional[float]:
+    if not horizontal_lines:
+        return None
+
+    y_candidates = np.array([(line[1] + line[3]) * 0.5 for line in horizontal_lines], dtype=np.float32)
+    if y_candidates.size == 0:
+        return None
+
+    min_y = float(min_inset_px)
+    max_y = float((card_height - 1) - min_inset_px)
+    if edge == "top":
+        valid = y_candidates[(y_candidates >= min_y) & (y_candidates <= 0.4 * card_height)]
+        if valid.size == 0:
+            return None
+        return float(np.min(valid))
+
+    if edge == "bottom":
+        valid = y_candidates[(y_candidates <= max_y) & (y_candidates >= 0.6 * card_height)]
+        if valid.size == 0:
+            return None
+        return float(np.max(valid))
+
+    return None
+
+
 def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -363,35 +393,38 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Tuple[Optional[np.ndarray], 
 
     if len(vertical_lines) >= 2 and len(horizontal_lines) >= 2:
         x_mids = np.array([(line[0] + line[2]) * 0.5 for line in vertical_lines], dtype=np.float32)
-        y_mids = np.array([(line[1] + line[3]) * 0.5 for line in horizontal_lines], dtype=np.float32)
-
         left_x = float(np.quantile(x_mids, 0.2))
         right_x = float(np.quantile(x_mids, 0.8))
-        top_y = float(np.quantile(y_mids, 0.2))
-        bottom_y = float(np.quantile(y_mids, 0.8))
+        top_y = _select_edge_horizontal_line(horizontal_lines, h, edge="top", min_inset_px=8)
+        bottom_y = _select_edge_horizontal_line(horizontal_lines, h, edge="bottom", min_inset_px=8)
 
-        candidate = _order_quad_points(
-            np.array([[left_x, top_y], [right_x, top_y], [right_x, bottom_y], [left_x, bottom_y]], dtype=np.float32)
-        )
-        candidate_area = float(cv2.contourArea(candidate))
-        min_area = 0.06 * float(h * w)
-        in_bounds = np.all(
-            (candidate[:, 0] >= -0.12 * w)
-            & (candidate[:, 0] <= 1.12 * w)
-            & (candidate[:, 1] >= -0.12 * h)
-            & (candidate[:, 1] <= 1.12 * h)
-        )
-        candidate_width = max(1e-6, right_x - left_x)
-        candidate_height = max(1e-6, bottom_y - top_y)
-        aspect = candidate_height / candidate_width
-        aspect_score = 1.0 - min(0.4, abs(aspect - CARD_ASPECT_RATIO) / CARD_ASPECT_RATIO)
-        coverage_score = min(1.0, candidate_area / max(min_area, 1.0))
-        confidence_score = float(max(0.0, min(1.0, 0.55 * coverage_score + 0.45 * aspect_score)))
+        if top_y is None or bottom_y is None or top_y >= bottom_y:
+            top_y = None
+            bottom_y = None
 
-        if candidate_area >= min_area and in_bounds and confidence_score >= 0.45:
-            frame_quad = candidate
-        else:
-            rejected_rectangles.append(candidate)
+        if top_y is not None and bottom_y is not None:
+            candidate = _order_quad_points(
+                np.array([[left_x, top_y], [right_x, top_y], [right_x, bottom_y], [left_x, bottom_y]], dtype=np.float32)
+            )
+            candidate_area = float(cv2.contourArea(candidate))
+            min_area = 0.06 * float(h * w)
+            in_bounds = np.all(
+                (candidate[:, 0] >= -0.12 * w)
+                & (candidate[:, 0] <= 1.12 * w)
+                & (candidate[:, 1] >= -0.12 * h)
+                & (candidate[:, 1] <= 1.12 * h)
+            )
+            candidate_width = max(1e-6, right_x - left_x)
+            candidate_height = max(1e-6, bottom_y - top_y)
+            aspect = candidate_height / candidate_width
+            aspect_score = 1.0 - min(0.4, abs(aspect - CARD_ASPECT_RATIO) / CARD_ASPECT_RATIO)
+            coverage_score = min(1.0, candidate_area / max(min_area, 1.0))
+            confidence_score = float(max(0.0, min(1.0, 0.55 * coverage_score + 0.45 * aspect_score)))
+
+            if candidate_area >= min_area and in_bounds and confidence_score >= 0.45:
+                frame_quad = candidate
+            else:
+                rejected_rectangles.append(candidate)
 
     print("Frame detection debug:")
     print("vertical lines:", len(vertical_lines))
