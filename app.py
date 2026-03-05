@@ -33,7 +33,7 @@ def _format_result(result: dict) -> str:
 
 def run_detector(image: np.ndarray):
     if image is None:
-        return "Please upload an image.", None
+        return "Error", "Card not detected", None
 
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     result = analyze_centering(bgr)
