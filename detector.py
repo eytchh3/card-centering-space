@@ -140,109 +140,49 @@ def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, matrix, (w_out, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
 
 
+def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 130)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+
 def _detect_frame_by_edge_scanning(warped: np.ndarray) -> Optional[Tuple[np.ndarray, Dict[str, int]]]:
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
+    card_area = float(h * w)
+    candidates: list[tuple[float, np.ndarray]] = []
 
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    max_x = int(0.35 * w)
-    max_y = int(0.35 * h)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 0.12 * card_area or area > 0.92 * card_area:
+            continue
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
 
-    # Energy is measured from local texture detail. Border regions are typically low-detail,
-    # while artwork transitions produce a sharp rise in energy.
-    def _energy_profile_left() -> np.ndarray:
-        strip_w = max(4, w // 150)
-        y0, y1 = int(0.12 * h), int(0.88 * h)
-        vals = []
-        for x in range(1, max_x):
-            roi = blur[y0:y1, x : min(w, x + strip_w)]
-            lap = cv2.Laplacian(roi, cv2.CV_32F, ksize=3)
-            vals.append(float(np.var(lap)))
-        return np.asarray(vals, dtype=np.float32)
+        quad = _order_quad_points(approx.reshape(4, 2).astype(np.float32))
+        x_min, y_min = np.min(quad, axis=0)
+        x_max, y_max = np.max(quad, axis=0)
+        if x_min < 4 or y_min < 4 or x_max > w - 5 or y_max > h - 5:
+            continue
 
-    def _energy_profile_right() -> np.ndarray:
-        strip_w = max(4, w // 150)
-        y0, y1 = int(0.12 * h), int(0.88 * h)
-        vals = []
-        for d in range(1, max_x):
-            x1 = max(0, w - d)
-            x0 = max(0, x1 - strip_w)
-            roi = blur[y0:y1, x0:x1]
-            lap = cv2.Laplacian(roi, cv2.CV_32F, ksize=3)
-            vals.append(float(np.var(lap)))
-        return np.asarray(vals, dtype=np.float32)
+        box = cv2.minAreaRect(contour)
+        box_area = cv2.contourArea(cv2.boxPoints(box))
+        if box_area <= 0:
+            continue
+        rectangularity = float(area / box_area)
+        score = area * rectangularity
+        candidates.append((score, quad))
 
-    def _energy_profile_top() -> np.ndarray:
-        strip_h = max(4, h // 150)
-        x0, x1 = int(0.12 * w), int(0.88 * w)
-        vals = []
-        for y in range(1, max_y):
-            roi = blur[y : min(h, y + strip_h), x0:x1]
-            lap = cv2.Laplacian(roi, cv2.CV_32F, ksize=3)
-            vals.append(float(np.var(lap)))
-        return np.asarray(vals, dtype=np.float32)
-
-    def _energy_profile_bottom() -> np.ndarray:
-        strip_h = max(4, h // 150)
-        x0, x1 = int(0.12 * w), int(0.88 * w)
-        vals = []
-        for d in range(1, max_y):
-            y1 = max(0, h - d)
-            y0 = max(0, y1 - strip_h)
-            roi = blur[y0:y1, x0:x1]
-            lap = cv2.Laplacian(roi, cv2.CV_32F, ksize=3)
-            vals.append(float(np.var(lap)))
-        return np.asarray(vals, dtype=np.float32)
-
-    def _find_boundary_offset(energy: np.ndarray) -> Optional[int]:
-        if energy.size < 12:
-            return None
-
-        k = max(7, (energy.size // 15) | 1)
-        smooth = cv2.GaussianBlur(energy.reshape(1, -1), (k, 1), 0).reshape(-1)
-        deriv = np.diff(smooth)
-        if deriv.size < 5:
-            return None
-
-        low_window = smooth[: max(4, smooth.size // 4)]
-        baseline = float(np.median(low_window))
-        base_std = float(np.std(low_window) + 1e-6)
-
-        rise_threshold = float(np.percentile(deriv, 88))
-        energy_threshold = baseline + 1.8 * base_std
-
-        for i, dval in enumerate(deriv):
-            if dval >= rise_threshold and smooth[i + 1] >= energy_threshold:
-                return int(i + 1)
-
-        fallback_idx = int(np.argmax(deriv) + 1)
-        if smooth[fallback_idx] >= baseline + 1.2 * base_std:
-            return fallback_idx
+    if not candidates:
         return None
-
-    left_off = _find_boundary_offset(_energy_profile_left())
-    right_off = _find_boundary_offset(_energy_profile_right())
-    top_off = _find_boundary_offset(_energy_profile_top())
-    bottom_off = _find_boundary_offset(_energy_profile_bottom())
-
-    if any(v is None for v in [left_off, right_off, top_off, bottom_off]):
-        return None
-
-    left = int(left_off)
-    right = int((w - 1) - right_off)
-    top = int(top_off)
-    bottom = int((h - 1) - bottom_off)
-
-    if right <= left + int(0.18 * w) or bottom <= top + int(0.18 * h):
-        return None
-
-    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
-    return frame_quad, {
-        "left": left,
-        "right": right,
-        "top": top,
-        "bottom": bottom,
-    }
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
@@ -281,7 +221,6 @@ def _draw_debug(
     card_quad: np.ndarray,
     frame_quad: np.ndarray,
     used_fallback_frame: bool,
-    boundary_offsets: Optional[Dict[str, int]] = None,
 ) -> np.ndarray:
     debug = warped.copy()
     h, w = debug.shape[:2]
@@ -295,13 +234,6 @@ def _draw_debug(
     left_x, right_x = int(frame[0][0]), int(frame[1][0])
     top_y, bottom_y = int(frame[0][1]), int(frame[3][1])
 
-    if boundary_offsets is not None:
-        cv2.line(debug, (left_x, 0), (left_x, h - 1), (0, 180, 255), 1)
-        cv2.line(debug, (right_x, 0), (right_x, h - 1), (0, 180, 255), 1)
-        cv2.line(debug, (0, top_y), (w - 1, top_y), (0, 180, 255), 1)
-        cv2.line(debug, (0, bottom_y), (w - 1, bottom_y), (0, 180, 255), 1)
-        cv2.putText(debug, f"L:{left_x} R:{(w-1)-right_x} T:{top_y} B:{(h-1)-bottom_y}", (14, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 255), 2)
-
     mid_y = h // 2
     mid_x = w // 2
     cv2.line(debug, (0, mid_y), (left_x, mid_y), (255, 0, 0), 2)
@@ -309,7 +241,7 @@ def _draw_debug(
     cv2.line(debug, (mid_x, 0), (mid_x, top_y), (0, 0, 255), 2)
     cv2.line(debug, (mid_x, bottom_y), (mid_x, h - 1), (0, 0, 255), 2)
 
-    label = "frame: border-color fallback" if used_fallback_frame else "frame: edge-scan"
+    label = "frame: border-color fallback" if used_fallback_frame else "frame: contour"
     cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     return debug
 
@@ -329,14 +261,11 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
 
     warped = _warp_card(image_bgr, card_quad)
 
-    scan_result = _detect_frame_by_edge_scanning(warped)
+    frame_quad = _detect_frame_by_contour(warped)
     used_fallback_frame = False
-    boundary_offsets: Optional[Dict[str, int]] = None
-    if scan_result is None:
+    if frame_quad is None:
         frame_quad = _estimate_frame_by_border_color(warped)
         used_fallback_frame = True
-    else:
-        frame_quad, boundary_offsets = scan_result
 
     h, w = warped.shape[:2]
     frame = _order_quad_points(frame_quad)
@@ -354,14 +283,13 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "centering_lr": _ratio_text(left_border, right_border),
         "centering_tb": _ratio_text(top_border, bottom_border),
         "card_detection": card_source,
-        "frame_detection": "border_color_fallback" if used_fallback_frame else "texture_edge_scan",
+        "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
         "warped_image": warped,
         "debug_image": _draw_debug(
             warped=warped,
             card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
             frame_quad=frame,
             used_fallback_frame=used_fallback_frame,
-            boundary_offsets=boundary_offsets,
         ),
     }
     return result
