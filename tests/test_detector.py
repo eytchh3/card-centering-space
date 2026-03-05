@@ -1,45 +1,78 @@
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 import cv2
 import numpy as np
 
-from detector import UNCERTAIN_MSG, analyze_centering
+from detector import analyze_centering
 
 
-def make_card_image(offset_x=0, offset_y=0):
-    img = np.full((900, 900, 3), 30, dtype=np.uint8)
+def make_card_image(offset_x=0, offset_y=0, perspective=False):
+    img = np.full((900, 900, 3), 35, dtype=np.uint8)
 
-    # Outer card
-    cv2.rectangle(img, (170, 90), (730, 810), (210, 210, 210), -1)
+    card = np.full((720, 520, 3), 215, dtype=np.uint8)
+    left = 65 + offset_x
+    right = 520 - 65 + offset_x
+    top = 80 + offset_y
+    bottom = 720 - 80 + offset_y
+    cv2.rectangle(card, (left, top), (right, bottom), (80, 80, 80), 3)
 
-    # Inner frame rails (chrome style)
-    left = 170 + 70 + offset_x
-    right = 730 - 70 + offset_x
-    top = 90 + 85 + offset_y
-    bottom = 810 - 85 + offset_y
+    src = np.array([[0, 0], [519, 0], [519, 719], [0, 719]], dtype=np.float32)
+    dst = np.array([[180, 90], [720, 110], [710, 820], [170, 800]], dtype=np.float32)
 
-    cv2.rectangle(img, (left, top), (right, bottom), (110, 110, 110), 2)
+    if perspective:
+        dst = np.array([[210, 120], [700, 80], [730, 810], [145, 840]], dtype=np.float32)
 
-    # subtle texture/noise
-    noise = np.random.default_rng(0).integers(0, 15, img.shape, dtype=np.uint8)
-    img = cv2.add(img, noise)
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    warped_card = cv2.warpPerspective(card, matrix, (900, 900))
+
+    mask = np.any(warped_card > 0, axis=2)
+    img[mask] = warped_card[mask]
     return img
 
 
-def test_centered_card_passes_or_high_ratio():
-    img = make_card_image(0, 0)
+def test_returns_expected_measurement_keys():
+    img = make_card_image(offset_x=0, offset_y=0)
     result = analyze_centering(img)
-    assert result.status in {"PASS", "FAIL", UNCERTAIN_MSG}
-    assert result.lr_ratio is None or result.lr_ratio > 0.80
-    assert result.tb_ratio is None or result.tb_ratio > 0.80
+
+    assert "error" not in result
+    for key in [
+        "left_border_px",
+        "right_border_px",
+        "top_border_px",
+        "bottom_border_px",
+        "centering_lr",
+        "centering_tb",
+        "debug_image",
+        "warped_image",
+    ]:
+        assert key in result
+
+    assert result["warped_image"] is not None
+    assert result["warped_image"].shape[0] == 1000
+    assert result["warped_image"].shape[1] == 700
 
 
-def test_offcenter_card_fails_on_lr_ratio():
-    img = make_card_image(offset_x=35)
-    result = analyze_centering(img, conf_threshold=0.1)
-    assert result.lr_ratio is not None
-    assert result.lr_ratio < 0.8182
+def test_offcenter_card_detects_lr_imbalance():
+    img = make_card_image(offset_x=30)
+    result = analyze_centering(img)
+
+    assert "error" not in result
+    assert abs(result["left_border_px"] - result["right_border_px"]) > 10
 
 
-def test_blank_image_uncertain():
+def test_perspective_photo_supported():
+    img = make_card_image(offset_x=10, offset_y=-8, perspective=True)
+    result = analyze_centering(img)
+
+    assert "error" not in result
+    assert isinstance(result["centering_lr"], str)
+    assert isinstance(result["centering_tb"], str)
+
+
+def test_blank_image_returns_error():
     img = np.zeros((600, 600, 3), dtype=np.uint8)
     result = analyze_centering(img)
-    assert result.status == UNCERTAIN_MSG
+    assert result["error"] == "Card could not be detected"
