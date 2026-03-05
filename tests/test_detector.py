@@ -46,6 +46,7 @@ def test_returns_expected_measurement_keys():
         "centering_lr",
         "centering_tb",
         "debug_image",
+        "warped_card",
     ]:
         assert key in result
 
@@ -66,6 +67,14 @@ def test_perspective_photo_supported():
     assert isinstance(result["centering_lr"], str)
     assert isinstance(result["centering_tb"], str)
 
+
+
+def test_warped_card_has_fixed_size():
+    img = make_card_image()
+    result = analyze_centering(img)
+
+    assert "error" not in result
+    assert result["warped_card"].shape[:2] == (1000, 700)
 
 def test_blank_image_returns_error():
     img = np.zeros((600, 600, 3), dtype=np.uint8)
