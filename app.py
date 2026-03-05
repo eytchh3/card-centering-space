@@ -30,8 +30,7 @@ def _format_result(result: dict) -> str:
         ]
     )
 
-
-def run_detector(image: np.ndarray):
+def run_detector(image):
     if image is None:
         return "Error", "Card not detected", None
 
