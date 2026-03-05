@@ -151,89 +151,33 @@ def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
 
     h, w = gray.shape
     card_area = float(h * w)
-    outer_margin_x = 0.2 * w
-    outer_margin_y = 0.2 * h
-    expected_ratio = CARD_ASPECT_RATIO
     candidates: list[tuple[float, np.ndarray]] = []
-
-    def _angle_deg(vec: np.ndarray) -> float:
-        return float(np.degrees(np.arctan2(vec[1], vec[0])) % 180.0)
-
-    def _distance_to_axis(angle: float, axis_angle: float) -> float:
-        raw = abs(angle - axis_angle)
-        return min(raw, 180.0 - raw)
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 0.22 * card_area or area > 0.90 * card_area:
+        if area < 0.12 * card_area or area > 0.92 * card_area:
             continue
-
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
         if len(approx) != 4:
             continue
 
         quad = _order_quad_points(approx.reshape(4, 2).astype(np.float32))
-
         x_min, y_min = np.min(quad, axis=0)
         x_max, y_max = np.max(quad, axis=0)
-        width = float(max(1.0, x_max - x_min))
-        height = float(max(1.0, y_max - y_min))
-        ratio = width / height
-
-        if abs(ratio - expected_ratio) > 0.16:
+        if x_min < 4 or y_min < 4 or x_max > w - 5 or y_max > h - 5:
             continue
 
-        # Reject shapes that live fully in central artwork area.
-        if x_min > outer_margin_x and x_max < (w - outer_margin_x) and y_min > outer_margin_y and y_max < (h - outer_margin_y):
-            continue
-
-        # Require each side to stay within the outer 20% margin band from its card edge.
-        left_dist = float(x_min)
-        right_dist = float((w - 1) - x_max)
-        top_dist = float(y_min)
-        bottom_dist = float((h - 1) - y_max)
-        if left_dist > outer_margin_x or right_dist > outer_margin_x or top_dist > outer_margin_y or bottom_dist > outer_margin_y:
-            continue
-
-        # Prefer frame edges parallel to the warped card edges.
-        top_vec = quad[1] - quad[0]
-        right_vec = quad[2] - quad[1]
-        bottom_vec = quad[2] - quad[3]
-        left_vec = quad[3] - quad[0]
-
-        top_dev = _distance_to_axis(_angle_deg(top_vec), 0.0)
-        bottom_dev = _distance_to_axis(_angle_deg(bottom_vec), 0.0)
-        right_dev = _distance_to_axis(_angle_deg(right_vec), 90.0)
-        left_dev = _distance_to_axis(_angle_deg(left_vec), 90.0)
-
-        parallel_error = (top_dev + bottom_dev + right_dev + left_dev) / 4.0
-        if parallel_error > 18.0:
-            continue
-
-        box_area = cv2.contourArea(cv2.boxPoints(cv2.minAreaRect(contour)))
+        box = cv2.minAreaRect(contour)
+        box_area = cv2.contourArea(cv2.boxPoints(box))
         if box_area <= 0:
             continue
         rectangularity = float(area / box_area)
-        if rectangularity < 0.82:
-            continue
-
-        # Scoring favors edge proximity and card-edge parallelism over raw area.
-        edge_proximity = (
-            (1.0 - (left_dist / max(outer_margin_x, 1.0)))
-            + (1.0 - (right_dist / max(outer_margin_x, 1.0)))
-            + (1.0 - (top_dist / max(outer_margin_y, 1.0)))
-            + (1.0 - (bottom_dist / max(outer_margin_y, 1.0)))
-        ) / 4.0
-        parallel_score = 1.0 - min(parallel_error, 25.0) / 25.0
-        ratio_score = 1.0 - min(abs(ratio - expected_ratio), 0.2) / 0.2
-
-        score = (0.45 * edge_proximity) + (0.35 * parallel_score) + (0.10 * rectangularity) + (0.10 * ratio_score)
+        score = area * rectangularity
         candidates.append((score, quad))
 
     if not candidates:
         return None
-
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
 
