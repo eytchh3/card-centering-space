@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-CARD_ASPECT_RATIO = 2.5 / 3.5  # width / height
+WARP_WIDTH = 700
 WARP_HEIGHT = 1000
 
 
@@ -131,13 +131,12 @@ def _expand_quad(quad: np.ndarray, scale: float, shape: Tuple[int, int]) -> np.n
 
 
 def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    w_out = int(WARP_HEIGHT * CARD_ASPECT_RATIO)
     dst = np.array(
-        [[0, 0], [w_out - 1, 0], [w_out - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
+        [[0, 0], [WARP_WIDTH - 1, 0], [WARP_WIDTH - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-    return cv2.warpPerspective(image, matrix, (w_out, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
+    return cv2.warpPerspective(image, matrix, (WARP_WIDTH, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
 
 
 def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
@@ -287,6 +286,7 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "card_detection": card_source,
         "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
         "warped_image": warped,
+        "warped_card": warped,
         "debug_image": _draw_debug(
             warped=warped,
             card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),

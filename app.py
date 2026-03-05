@@ -7,7 +7,6 @@ logger = logging.getLogger(__name__)
 
 import cv2
 import gradio as gr
-import numpy as np
 
 from detector import analyze_centering
 
@@ -30,19 +29,25 @@ def _format_result(result: dict) -> str:
         ]
     )
 
+
 def run_detector(image):
     if image is None:
-        return "Error", "Card not detected", None
+        return "Error: No image", None, None
 
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     result = analyze_centering(bgr)
+
+    if "error" in result:
+        return "Error: Card not detected", None, None
+
     text = _format_result(result)
-
     debug = result.get("debug_image")
-    if debug is None:
-        return text, None
+    warped_card = result.get("warped_card")
 
-    return text, cv2.cvtColor(debug, cv2.COLOR_BGR2RGB)
+    debug_rgb = cv2.cvtColor(debug, cv2.COLOR_BGR2RGB) if debug is not None else None
+    warped_rgb = cv2.cvtColor(warped_card, cv2.COLOR_BGR2RGB) if warped_card is not None else None
+
+    return text, debug_rgb, warped_rgb
 
 
 with gr.Blocks(title="Trading Card Centering Detector") as demo:
@@ -63,10 +68,11 @@ If card detection fails, the API returns: `{"error": "Card could not be detected
     with gr.Row():
         inp = gr.Image(type="numpy", label="Card Photo")
         out_img = gr.Image(type="numpy", label="Debug Overlay")
+        out_warp = gr.Image(type="numpy", label="Warped Card Preview")
     out_text = gr.Textbox(label="Centering Result", lines=10)
 
     btn = gr.Button("Analyze")
-    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img])
+    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img, out_warp])
 
 demo.queue()
 
