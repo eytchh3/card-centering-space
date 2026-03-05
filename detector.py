@@ -5,9 +5,8 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-WARP_WIDTH = 700
+CARD_ASPECT_RATIO = 2.5 / 3.5  # width / height
 WARP_HEIGHT = 1000
-CARD_ASPECT_RATIO = WARP_WIDTH / WARP_HEIGHT
 
 
 def _order_quad_points(pts: np.ndarray) -> np.ndarray:
@@ -15,10 +14,10 @@ def _order_quad_points(pts: np.ndarray) -> np.ndarray:
     s = pts.sum(axis=1)
     d = np.diff(pts, axis=1).reshape(-1)
     ordered = np.zeros((4, 2), dtype=np.float32)
-    ordered[0] = pts[np.argmin(s)]
-    ordered[1] = pts[np.argmin(d)]
-    ordered[2] = pts[np.argmax(s)]
-    ordered[3] = pts[np.argmax(d)]
+    ordered[0] = pts[np.argmin(s)]  # tl
+    ordered[1] = pts[np.argmin(d)]  # tr
+    ordered[2] = pts[np.argmax(s)]  # br
+    ordered[3] = pts[np.argmax(d)]  # bl
     return ordered
 
 
@@ -48,38 +47,7 @@ def _line_intersection(
     return intersection.astype(np.float32)
 
 
-def _quad_by_contour(gray: np.ndarray) -> Optional[np.ndarray]:
-    h, w = gray.shape
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 45, 145)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    img_area = float(h * w)
-    best_area = -1.0
-    best_quad: Optional[np.ndarray] = None
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 0.12 * img_area:
-            continue
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) != 4:
-            continue
-
-        quad = _order_quad_points(approx.reshape(4, 2).astype(np.float32))
-        if area > best_area:
-            best_area = area
-            best_quad = quad
-
-    return best_quad
-
-
-def _quad_by_hough(gray: np.ndarray) -> Optional[np.ndarray]:
+def _quad_from_hough(gray: np.ndarray, min_area_ratio: float) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     h, w = gray.shape
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
@@ -93,34 +61,26 @@ def _quad_by_hough(gray: np.ndarray) -> Optional[np.ndarray]:
         minLineLength=int(min(h, w) * 0.2),
         maxLineGap=20,
     )
+
     if lines is None or len(lines) < 8:
-        return None
+        return None, {"reason": "insufficient_hough_lines"}
 
     vertical_segments = []
     horizontal_segments = []
-    vertical_lengths = []
-    horizontal_lengths = []
-
     for raw in lines[:, 0, :]:
         x1, y1, x2, y2 = map(float, raw)
         angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0
-        seg = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-        length = float(np.hypot(x2 - x1, y2 - y1))
+        segment = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
         if angle < 25 or angle > 155:
-            horizontal_segments.append(seg)
-            horizontal_lengths.append(length)
+            horizontal_segments.append(segment)
         elif 65 < angle < 115:
-            vertical_segments.append(seg)
-            vertical_lengths.append(length)
+            vertical_segments.append(segment)
 
     if len(vertical_segments) < 2 or len(horizontal_segments) < 2:
-        return None
+        return None, {"reason": "missing_line_orientations"}
 
-    v_idx = np.argsort(vertical_lengths)[-max(2, len(vertical_lengths) // 2) :]
-    h_idx = np.argsort(horizontal_lengths)[-max(2, len(horizontal_lengths) // 2) :]
-
-    v_pts = np.vstack([vertical_segments[i] for i in v_idx])
-    h_pts = np.vstack([horizontal_segments[i] for i in h_idx])
+    v_pts = np.vstack(vertical_segments)
+    h_pts = np.vstack(horizontal_segments)
 
     x_q1, x_q3 = np.quantile(v_pts[:, 0], [0.25, 0.75])
     y_q1, y_q3 = np.quantile(h_pts[:, 1], [0.25, 0.75])
@@ -130,88 +90,35 @@ def _quad_by_hough(gray: np.ndarray) -> Optional[np.ndarray]:
     top_line = _line_from_points(h_pts[h_pts[:, 1] <= y_q1])
     bottom_line = _line_from_points(h_pts[h_pts[:, 1] >= y_q3])
 
-    if any(v is None for v in [left_line, right_line, top_line, bottom_line]):
-        return None
+    if any(line is None for line in [left_line, right_line, top_line, bottom_line]):
+        return None, {"reason": "line_fitting_failed"}
 
     tl = _line_intersection(left_line, top_line)
     tr = _line_intersection(right_line, top_line)
     br = _line_intersection(right_line, bottom_line)
     bl = _line_intersection(left_line, bottom_line)
-    if any(v is None for v in [tl, tr, br, bl]):
-        return None
+
+    if any(corner is None for corner in [tl, tr, br, bl]):
+        return None, {"reason": "line_intersection_failed"}
 
     quad = _order_quad_points(np.array([tl, tr, br, bl], dtype=np.float32))
-    return quad
 
+    area = cv2.contourArea(quad)
+    min_area = min_area_ratio * float(h * w)
+    if area < min_area:
+        return None, {"reason": "quad_too_small", "area": float(area)}
 
-def _angle_score(quad: np.ndarray) -> float:
-    pts = quad.astype(np.float32)
-    score = 0.0
-    for i in range(4):
-        a = pts[(i - 1) % 4] - pts[i]
-        b = pts[(i + 1) % 4] - pts[i]
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-6 or nb < 1e-6:
-            return 0.0
-        cosang = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
-        angle = np.degrees(np.arccos(cosang))
-        score += max(0.0, 1.0 - abs(angle - 90.0) / 45.0)
-    return score / 4.0
+    in_bounds = np.all((quad[:, 0] >= -0.1 * w) & (quad[:, 0] <= 1.1 * w) & (quad[:, 1] >= -0.1 * h) & (quad[:, 1] <= 1.1 * h))
+    if not in_bounds:
+        return None, {"reason": "quad_out_of_bounds"}
 
-
-def _edge_gradient_score(gray: np.ndarray, quad: np.ndarray) -> float:
-    grad = cv2.Sobel(gray, cv2.CV_32F, 1, 1, ksize=3)
-    vals = []
-    for i in range(4):
-        p0 = quad[i].astype(np.int32)
-        p1 = quad[(i + 1) % 4].astype(np.int32)
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.line(mask, tuple(p0), tuple(p1), 255, 5)
-        edge_vals = grad[mask > 0]
-        if edge_vals.size == 0:
-            vals.append(0.0)
-        else:
-            vals.append(float(np.mean(np.abs(edge_vals))))
-    m = float(np.mean(vals))
-    return float(np.clip(m / 40.0, 0.0, 1.0))
-
-
-def _score_quad(gray: np.ndarray, quad: np.ndarray) -> float:
-    h, w = gray.shape
-    area = max(0.0, cv2.contourArea(quad))
-    area_score = float(np.clip(area / (h * w), 0.0, 1.0))
-    angle_score = _angle_score(quad)
-    grad_score = _edge_gradient_score(gray, quad)
-
-    x_ok = np.all((quad[:, 0] >= -0.1 * w) & (quad[:, 0] <= 1.1 * w))
-    y_ok = np.all((quad[:, 1] >= -0.1 * h) & (quad[:, 1] <= 1.1 * h))
-    if not (x_ok and y_ok):
-        return 0.0
-
-    return (0.45 * area_score) + (0.30 * angle_score) + (0.25 * grad_score)
-
-
-def _detect_card_outer_quad(gray: np.ndarray) -> Optional[np.ndarray]:
-    cand_a = _quad_by_contour(gray)
-    cand_b = _quad_by_hough(gray)
-
-    candidates = []
-    if cand_a is not None:
-        candidates.append((cand_a, _score_quad(gray, cand_a), "contour"))
-    if cand_b is not None:
-        candidates.append((cand_b, _score_quad(gray, cand_b), "hough"))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    best_quad, best_score, _ = candidates[0]
-
-    if best_score < 0.22:
-        return None
-
-    return _order_quad_points(best_quad)
+    return quad, {
+        "reason": "ok",
+        "hough_lines": int(len(lines)),
+        "vertical_segments": int(len(vertical_segments)),
+        "horizontal_segments": int(len(horizontal_segments)),
+        "area": float(area),
+    }
 
 
 def _expand_quad(quad: np.ndarray, scale: float, shape: Tuple[int, int]) -> np.ndarray:
@@ -224,80 +131,58 @@ def _expand_quad(quad: np.ndarray, scale: float, shape: Tuple[int, int]) -> np.n
 
 
 def _warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    w_out = int(WARP_HEIGHT * CARD_ASPECT_RATIO)
     dst = np.array(
-        [[0, 0], [WARP_WIDTH - 1, 0], [WARP_WIDTH - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
+        [[0, 0], [w_out - 1, 0], [w_out - 1, WARP_HEIGHT - 1], [0, WARP_HEIGHT - 1]],
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-    return cv2.warpPerspective(image, matrix, (WARP_WIDTH, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
+    return cv2.warpPerspective(image, matrix, (w_out, WARP_HEIGHT), flags=cv2.INTER_LINEAR)
 
 
-def _detect_frame_by_hsv_mask(warped: np.ndarray) -> Optional[np.ndarray]:
-    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    h, w = hsv.shape[:2]
+def _detect_frame_by_contour(warped: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 130)
 
-    lower_blue = np.array([85, 35, 20], dtype=np.uint8)
-    upper_blue = np.array([140, 255, 165], dtype=np.uint8)
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    # Include dark low-saturation frame lines often seen in scans/synthetic cards.
-    lower_dark = np.array([0, 0, 15], dtype=np.uint8)
-    upper_dark = np.array([180, 120, 110], dtype=np.uint8)
-    mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
-
-    mask = cv2.bitwise_or(mask_blue, mask_dark)
-
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
+
+def _detect_frame_by_edge_scanning(warped: np.ndarray) -> Optional[Tuple[np.ndarray, Dict[str, int]]]:
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
     card_area = float(h * w)
-    best_quad: Optional[np.ndarray] = None
-    best_score = -1.0
+    candidates: list[tuple[float, np.ndarray]] = []
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 0.05 * card_area or area > 0.90 * card_area:
+        if area < 0.12 * card_area or area > 0.92 * card_area:
             continue
-
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
 
-        if len(approx) == 4:
-            quad = _order_quad_points(approx.reshape(4, 2).astype(np.float32))
-        else:
-            rect = cv2.minAreaRect(contour)
-            quad = _order_quad_points(cv2.boxPoints(rect).astype(np.float32))
-
+        quad = _order_quad_points(approx.reshape(4, 2).astype(np.float32))
         x_min, y_min = np.min(quad, axis=0)
         x_max, y_max = np.max(quad, axis=0)
-        width = float(max(1.0, x_max - x_min))
-        height = float(max(1.0, y_max - y_min))
-        ratio = width / height
-
-        if abs(ratio - CARD_ASPECT_RATIO) > 0.25:
-            continue
-        if x_min < 1 or y_min < 1 or x_max > (w - 2) or y_max > (h - 2):
+        if x_min < 4 or y_min < 4 or x_max > w - 5 or y_max > h - 5:
             continue
 
-        box_area = cv2.contourArea(quad)
+        box = cv2.minAreaRect(contour)
+        box_area = cv2.contourArea(cv2.boxPoints(box))
         if box_area <= 0:
             continue
+        rectangularity = float(area / box_area)
+        score = area * rectangularity
+        candidates.append((score, quad))
 
-        rectangularity = float(area / max(box_area, 1.0))
-        center_bias = abs((x_min + x_max) * 0.5 - (w * 0.5)) / max(w, 1.0)
-        score = (0.65 * (area / card_area)) + (0.25 * rectangularity) + (0.10 * (1.0 - min(center_bias, 1.0)))
-
-        if score > best_score:
-            best_score = score
-            best_quad = quad
-
-    return best_quad
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
@@ -323,6 +208,8 @@ def _estimate_frame_by_border_color(warped: np.ndarray) -> np.ndarray:
     frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
     return frame_quad
 
+    frame_quad = np.array([[left, top], [right, top], [right, bottom], [left, bottom]], dtype=np.float32)
+    return frame_quad
 
 def _ratio_text(a: float, b: float) -> str:
     total = max(a + b, 1e-6)
@@ -331,31 +218,52 @@ def _ratio_text(a: float, b: float) -> str:
     return f"{left}/{right}"
 
 
-def _draw_outer_debug(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    dbg = image.copy()
-    pts = quad.astype(int)
-    cv2.polylines(dbg, [pts], True, (255, 255, 0), 2)  # cyan edges
-    for x, y in pts:
-        cv2.circle(dbg, (int(x), int(y)), 7, (0, 255, 255), -1)  # yellow corners
-    return dbg
+def _draw_debug(
+    warped: np.ndarray,
+    card_quad: np.ndarray,
+    frame_quad: np.ndarray,
+    used_fallback_frame: bool,
+) -> np.ndarray:
+    debug = warped.copy()
+    h, w = debug.shape[:2]
+
+    for x, y in card_quad.astype(int):
+        cv2.circle(debug, (x, y), 8, (0, 255, 255), -1)
+
+    frame = frame_quad.astype(int)
+    cv2.polylines(debug, [frame], True, (0, 255, 0), 2)
+
+    left_x, right_x = int(frame[0][0]), int(frame[1][0])
+    top_y, bottom_y = int(frame[0][1]), int(frame[3][1])
+
+    mid_y = h // 2
+    mid_x = w // 2
+    cv2.line(debug, (0, mid_y), (left_x, mid_y), (255, 0, 0), 2)
+    cv2.line(debug, (right_x, mid_y), (w - 1, mid_y), (255, 0, 0), 2)
+    cv2.line(debug, (mid_x, 0), (mid_x, top_y), (0, 0, 255), 2)
+    cv2.line(debug, (mid_x, bottom_y), (mid_x, h - 1), (0, 0, 255), 2)
+
+    label = "frame: border-color fallback" if used_fallback_frame else "frame: contour"
+    cv2.putText(debug, label, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    return debug
 
 
 def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    card_quad = _detect_card_outer_quad(gray)
+    card_quad, card_meta = _quad_from_hough(gray, min_area_ratio=0.2)
+    card_source = "outer_edge"
+
     if card_quad is None:
-        inner_quad = _quad_by_hough(gray)
+        inner_quad, inner_meta = _quad_from_hough(gray, min_area_ratio=0.08)
         if inner_quad is None:
-            return {"error": "Card could not be detected"}
-        card_quad = _expand_quad(inner_quad, scale=1.15, shape=gray.shape)
-        card_source = "inner_hough_fallback"
-    else:
-        card_source = "outer_dual_method"
+            return {"error": "Card could not be detected", "details": {"outer": card_meta, "inner": inner_meta}}
+        card_quad = _expand_quad(inner_quad, scale=1.18, shape=gray.shape)
+        card_source = "inner_frame_fallback"
 
     warped = _warp_card(image_bgr, card_quad)
 
-    frame_quad = _detect_frame_by_hsv_mask(warped)
+    frame_quad = _detect_frame_by_contour(warped)
     used_fallback_frame = False
     if frame_quad is None:
         frame_quad = _estimate_frame_by_border_color(warped)
@@ -377,8 +285,13 @@ def analyze_centering(image_bgr: np.ndarray) -> Dict[str, Any]:
         "centering_lr": _ratio_text(left_border, right_border),
         "centering_tb": _ratio_text(top_border, bottom_border),
         "card_detection": card_source,
-        "frame_detection": "border_color_fallback" if used_fallback_frame else "hsv_mask",
+        "frame_detection": "border_color_fallback" if used_fallback_frame else "contour",
         "warped_image": warped,
-        "debug_image": _draw_outer_debug(image_bgr, card_quad),
+        "debug_image": _draw_debug(
+            warped=warped,
+            card_quad=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32),
+            frame_quad=frame,
+            used_fallback_frame=used_fallback_frame,
+        ),
     }
     return result

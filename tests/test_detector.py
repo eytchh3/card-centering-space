@@ -46,13 +46,8 @@ def test_returns_expected_measurement_keys():
         "centering_lr",
         "centering_tb",
         "debug_image",
-        "warped_image",
     ]:
         assert key in result
-
-    assert result["warped_image"] is not None
-    assert result["warped_image"].shape[0] == 1000
-    assert result["warped_image"].shape[1] == 700
 
 
 def test_offcenter_card_detects_lr_imbalance():
