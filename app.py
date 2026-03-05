@@ -66,7 +66,7 @@ If card detection fails, the API returns: `{"error": "Card could not be detected
     out_text = gr.Textbox(label="Centering Result", lines=10)
 
     btn = gr.Button("Analyze")
-    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img], api_name="/analyze")
+    btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img])
 
 demo.queue()
 
