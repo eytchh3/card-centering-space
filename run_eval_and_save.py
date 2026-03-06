@@ -72,10 +72,44 @@ def parse_summary(log_text: str, return_code: int, command: list[str]) -> dict:
     }
 
 
-def main() -> int:
+def build_summary_lines(summary: dict, txt_path: Path, json_path: Path) -> list[str]:
+    totals = summary["totals"]
+    total_images = totals["fixtures_found"]
+    if total_images is None:
+        total_images = totals["completed_total"]
+    if total_images is None:
+        total_images = totals["images_reported"]
+
+    fail_images = [
+        item["image"] for item in summary["per_image"] if item["status"] == "FAIL"
+    ]
+
+    lines = [
+        "=== Evaluation summary ===",
+        f"Total images: {total_images} | Pass: {totals['ok']} | Fail: {totals['fail']}",
+    ]
+
+    if fail_images:
+        lines.append("Failing files (top 10):")
+        lines.extend([f"- {image}" for image in fail_images[:10]])
+    else:
+        lines.append("Failing files (top 10): none")
+
+    if total_images == 0:
+        lines.append(
+            "No fixtures found. Place evaluation images under "
+            "'fixtures/centering/' (or pass --fixtures-dir to eval_centering.py)."
+        )
+
+    lines.append(f"Saved log: {txt_path.as_posix()}")
+    lines.append(f"Saved json: {json_path.as_posix()}")
+
+    return lines
+
+
+def run_eval_and_save() -> dict:
     if not EVAL_SCRIPT.exists():
-        print(f"Error: expected '{EVAL_SCRIPT}' at repository root.", file=sys.stderr)
-        return 1
+        raise FileNotFoundError(f"expected '{EVAL_SCRIPT}' at repository root")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -107,40 +141,28 @@ def main() -> int:
         json.dump(summary, summary_file, indent=2)
         summary_file.write("\n")
 
-    totals = summary["totals"]
-    total_images = totals["fixtures_found"]
-    if total_images is None:
-        total_images = totals["completed_total"]
-    if total_images is None:
-        total_images = totals["images_reported"]
+    summary_lines = build_summary_lines(summary=summary, txt_path=txt_path, json_path=json_path)
+    for line in summary_lines:
+        print(line)
 
-    fail_images = [
-        item["image"] for item in summary["per_image"] if item["status"] == "FAIL"
-    ]
+    return {
+        "return_code": return_code,
+        "summary": summary,
+        "txt_path": txt_path,
+        "json_path": json_path,
+        "summary_lines": summary_lines,
+        "raw_output": combined_output,
+    }
 
-    print("\n=== Evaluation summary ===")
-    print(
-        "Total images: "
-        f"{total_images} | Pass: {totals['ok']} | Fail: {totals['fail']}"
-    )
 
-    if fail_images:
-        print("Failing files (top 10):")
-        for image in fail_images[:10]:
-            print(f"- {image}")
-    else:
-        print("Failing files (top 10): none")
+def main() -> int:
+    try:
+        result = run_eval_and_save()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}.", file=sys.stderr)
+        return 1
 
-    if total_images == 0:
-        print(
-            "No fixtures found. Place evaluation images under "
-            "'fixtures/centering/' (or pass --fixtures-dir to eval_centering.py)."
-        )
-
-    print(f"Saved log: {txt_path.as_posix()}")
-    print(f"Saved json: {json_path.as_posix()}")
-
-    return return_code
+    return result["return_code"]
 
 
 if __name__ == "__main__":
