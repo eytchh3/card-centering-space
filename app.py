@@ -9,6 +9,7 @@ import cv2
 import gradio as gr
 
 from detector import analyze_centering
+from run_eval_and_save import run_eval_and_save
 
 
 def _format_result(result: dict) -> str:
@@ -50,6 +51,46 @@ def run_detector(image):
     return text, debug_rgb, warped_rgb
 
 
+def run_centering_eval() -> str:
+    try:
+        result = run_eval_and_save()
+    except FileNotFoundError as exc:
+        return f"Error: {exc}."
+
+    totals = result["summary"]["totals"]
+    fail_images = [
+        item["image"] for item in result["summary"]["per_image"] if item["status"] == "FAIL"
+    ]
+    total_images = totals["fixtures_found"]
+    if total_images is None:
+        total_images = totals["completed_total"]
+    if total_images is None:
+        total_images = totals["images_reported"]
+
+    lines = [
+        "Centering eval complete",
+        f"Total fixtures: {total_images}",
+        f"Pass count: {totals['ok']}",
+        f"Fail count: {totals['fail']}",
+    ]
+
+    if fail_images:
+        lines.append("Top 10 failing filenames:")
+        lines.extend([f"- {name}" for name in fail_images[:10]])
+    else:
+        lines.append("Top 10 failing filenames: none")
+
+    if total_images == 0:
+        lines.append(
+            "No fixtures found. Place evaluation images under "
+            "'fixtures/centering/' (or pass --fixtures-dir to eval_centering.py)."
+        )
+
+    lines.append(f"Saved .txt artifact: {result['txt_path'].as_posix()}")
+    lines.append(f"Saved .json artifact: {result['json_path'].as_posix()}")
+    return "\n".join(lines)
+
+
 with gr.Blocks(title="Trading Card Centering Detector") as demo:
     gr.Markdown(
         """
@@ -73,6 +114,11 @@ If card detection fails, the API returns: `{"error": "Card could not be detected
 
     btn = gr.Button("Analyze")
     btn.click(fn=run_detector, inputs=inp, outputs=[out_text, out_img, out_warp])
+
+    gr.Markdown("---")
+    eval_btn = gr.Button("Run Centering Eval")
+    eval_text = gr.Textbox(label="Centering Eval Output", lines=18)
+    eval_btn.click(fn=run_centering_eval, outputs=eval_text)
 
 demo.queue()
 
