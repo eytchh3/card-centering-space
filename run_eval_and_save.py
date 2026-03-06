@@ -107,9 +107,38 @@ def main() -> int:
         json.dump(summary, summary_file, indent=2)
         summary_file.write("\n")
 
-    print("\nCreated files:")
-    print(txt_path.as_posix())
-    print(json_path.as_posix())
+    totals = summary["totals"]
+    total_images = totals["fixtures_found"]
+    if total_images is None:
+        total_images = totals["completed_total"]
+    if total_images is None:
+        total_images = totals["images_reported"]
+
+    fail_images = [
+        item["image"] for item in summary["per_image"] if item["status"] == "FAIL"
+    ]
+
+    print("\n=== Evaluation summary ===")
+    print(
+        "Total images: "
+        f"{total_images} | Pass: {totals['ok']} | Fail: {totals['fail']}"
+    )
+
+    if fail_images:
+        print("Failing files (top 10):")
+        for image in fail_images[:10]:
+            print(f"- {image}")
+    else:
+        print("Failing files (top 10): none")
+
+    if total_images == 0:
+        print(
+            "No fixtures found. Place evaluation images under "
+            "'fixtures/centering/' (or pass --fixtures-dir to eval_centering.py)."
+        )
+
+    print(f"Saved log: {txt_path.as_posix()}")
+    print(f"Saved json: {json_path.as_posix()}")
 
     return return_code
 
