@@ -1,0 +1,8 @@
+# Local evaluation fixtures (keep README only)
+fixtures/centering/**/*.png
+fixtures/centering/**/*.jpg
+fixtures/centering/**/*.jpeg
+fixtures/centering/**/*.webp
+fixtures/centering/**/*.bmp
+fixtures/centering/**/*.tif
+fixtures/centering/**/*.tiff
